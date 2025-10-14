@@ -28,13 +28,8 @@ except ImportError:
     SPEECH_AVAILABLE = False
     print("⚠️ speech_recognition not installed. Run: pip install SpeechRecognition pydub pyaudio")
 
-# Try to import TTS
-try:
-    from pyttsx3 import init as tts_init
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    print("⚠️ pyttsx3 not installed. Run: pip install pyttsx3")
+# TTS will use OpenAI's built-in API (no extra installation needed)
+TTS_AVAILABLE = True
 
 # Import OpenAI
 try:
@@ -42,49 +37,70 @@ try:
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
+    TTS_AVAILABLE = False
     print("⚠️ openai not installed. Run: pip install openai")
 
 
 class TextToSpeech:
     """
     OS Concept: Audio I/O and Device Management
-    - Uses pyttsx3 for text-to-speech synthesis
-    - Cross-platform audio output
+    - Uses OpenAI's text-to-speech API
     - Real-time speech generation
+    - No local installation needed
     """
     
-    def __init__(self):
-        self.engine = None
-        if TTS_AVAILABLE:
-            try:
-                self.engine = tts_init()
-                self.engine.setProperty('rate', 150)  # Speed
-                self.engine.setProperty('volume', 0.9)  # Volume
-            except Exception as e:
-                print(f"⚠️ TTS initialization warning: {e}")
+    def __init__(self, client=None):
+        self.client = client
+        self.temp_dir = Path("./tts_cache")
+        self.temp_dir.mkdir(exist_ok=True)
     
     def speak(self, text: str, wait: bool = True):
-        """Convert text to speech"""
-        if not self.engine:
+        """Convert text to speech using OpenAI API"""
+        if not text or len(text.strip()) == 0 or not self.client:
             return
         
         try:
-            self.engine.say(text)
+            # Truncate text if too long
+            text = text[:1000] if len(text) > 1000 else text
+            
+            print(f"🔊 Speaking...")
+            
+            # Generate audio using OpenAI TTS
+            response = self.client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text
+            )
+            
+            # Save and play audio
+            audio_file = self.temp_dir / f"speech_{int(time.time())}.mp3"
+            response.stream_to_file(str(audio_file))
+            
+            # Play the audio file
+            if sys.platform == "win32":
+                os.startfile(str(audio_file))
+            elif sys.platform == "darwin":  # macOS
+                subprocess.run(["afplay", str(audio_file)])
+            else:  # Linux
+                subprocess.run(["paplay", str(audio_file)])
+            
+            # Wait for playback
             if wait:
-                self.engine.runAndWait()
-            else:
-                # Non-blocking speech
-                threading.Thread(target=self.engine.runAndWait, daemon=True).start()
+                time.sleep(2)
+            
+            # Clean up old files
+            try:
+                if audio_file.exists():
+                    audio_file.unlink()
+            except:
+                pass
+        
         except Exception as e:
             print(f"⚠️ TTS Error: {e}")
     
     def stop(self):
         """Stop speaking"""
-        if self.engine:
-            try:
-                self.engine.stop()
-            except:
-                pass
+        pass
 
 
 class SpeechToText:
@@ -412,13 +428,11 @@ class ShellAssistant:
     
     def __init__(self):
         self.proc_manager = ProcessManager()
-        self.tts = TextToSpeech()
-        self.stt = SpeechToText()
         self.assistant = None
         self.running = True
-        self.voice_mode = False
+        self.voice_mode = True  # Start in voice mode by default
         
-        # Initialize conversational assistant
+        # Initialize conversational assistant first to get the client
         try:
             self.assistant = ConversationalAssistant()
             print("✓ OpenAI API connected successfully")
@@ -426,8 +440,14 @@ class ShellAssistant:
             print(f"✗ Error initializing OpenAI: {e}")
             sys.exit(1)
         
+        # Now initialize TTS with the OpenAI client
+        self.tts = TextToSpeech(client=self.assistant.client)
+        
+        # Initialize STT
+        self.stt = SpeechToText()
+        
         # Check TTS availability
-        if TTS_AVAILABLE:
+        if LLM_AVAILABLE and self.assistant.client:
             print("✓ Text-to-Speech available")
         else:
             print("ℹ️ Text-to-Speech not available")
@@ -440,16 +460,32 @@ class ShellAssistant:
     
     def speak(self, text: str):
         """Speak text using TTS"""
+        if not text or len(text.strip()) == 0:
+            return
+        
         if TTS_AVAILABLE:
-            print(f"🔊 {text}")
-            self.tts.speak(text)
+            print(f"🔊 Speaking...")
+            self.tts.speak(text, wait=True)  # Wait for TTS to complete
         else:
-            print(f"📝 {text}")
+            # Fallback to Windows PowerShell TTS
+            try:
+                print(f"🔊 Speaking...")
+                # Use Windows built-in text-to-speech via PowerShell
+                powershell_cmd = f'Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text.replace(chr(34), chr(34)+chr(34))}")'
+                subprocess.Popen(
+                    ["powershell", "-Command", powershell_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                time.sleep(1)  # Give it time to start
+            except Exception as e:
+                print(f"📝 {text}")
     
     def listen(self) -> Optional[str]:
         """Listen and get user input"""
         if self.voice_mode and SPEECH_AVAILABLE:
-            return self.stt.listen()
+            stt = SpeechToText()
+            return stt.listen()
         else:
             return input("\n🔹 > ").strip()
     
@@ -556,9 +592,9 @@ Threads: {info['num_threads']}"""
         print("✓ Audio Device Management (TTS/STT)")
         print("✓ LLM-based Conversational AI (OpenAI GPT-3.5)")
         print("=" * 70)
-        print("\nType 'help' for commands or 'v' for voice mode\n")
+        print("\nType 'help' for commands or 'text' to switch to text mode\n")
         
-        self.speak("Hello! I'm your AI Shell Assistant. How can I help you today?")
+        self.speak("Hello! I am your AI Shell Assistant. Voice mode is now active. How can I help you today?")
         
         while self.running:
             try:
@@ -589,28 +625,41 @@ Threads: {info['num_threads']}"""
                         print("Voice mode disabled. Using text input.")
                     continue
                 
-                # Process with AI assistant
-                print("⏳ Processing your request...")
+                # Process with AI assistant (no listening during processing)
+                print("\n⏳ Processing your request... (please wait)")
                 response_text, command, params = self.assistant.chat(user_input)
                 
                 # Speak the response
+                print(f"\nAssistant: {response_text}")
                 self.speak(response_text)
                 
                 # Execute command if present
                 if command:
                     print(f"\n🔧 Executing: {command}")
                     result = self.execute_command(command, params)
-                    print(f"\n{result}\n")
-                    self.speak(result)
+                    print(f"\n{'='*70}")
+                    print("COMMAND RESULTS:")
+                    print(f"{'='*70}")
+                    print(f"{result}")
+                    print(f"{'='*70}\n")
+                    
+                    # Speak a shortened version for audio feedback
+                    lines = result.split('\n')
+                    if len(lines) > 3:
+                        # For long results, speak summary
+                        self.speak(f"I found {len(lines)} items. Check the console for details.")
+                    else:
+                        # For short results, speak everything
+                        self.speak(result)
+                
+                print("\n" + "="*70)
             
             except KeyboardInterrupt:
                 print("\n\n")
-                self.speak("Interrupted. Exiting...")
                 self.running = False
             except Exception as e:
                 error_msg = f"An error occurred: {str(e)}"
                 print(f"❌ {error_msg}")
-                self.speak(error_msg)
 
 
 def main():
@@ -620,7 +669,7 @@ def main():
     print("=" * 70)
     
     print("\n📦 Required Installations:")
-    print("pip install psutil SpeechRecognition pydub pyaudio python-dotenv openai pyttsx3")
+    print("pip install psutil SpeechRecognition pydub pyaudio python-dotenv openai")
     
     print("\n🔑 Setup:")
     print("1. Set OPENAI_API_KEY environment variable or create .env file")
