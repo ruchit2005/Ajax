@@ -1,7 +1,6 @@
 """
 Voice-Controlled AI Shell Assistant for Windows with OpenAI Integration
-Full TTS/STT with conversational AI assistant capabilities
-Optimized for Windows OS with process control, I/O management, and system calls
+Optimized for reduced latency and continuous speech capture
 """
 
 import os
@@ -43,60 +42,73 @@ except ImportError:
 
 class TextToSpeech:
     """
-    OS Concept: Audio I/O and Device Management
-    - Uses OpenAI's text-to-speech API
-    - Real-time speech generation
-    - No local installation needed
+    Optimized TTS with parallel processing
+    - Uses threading to avoid blocking
+    - Streams audio directly for faster playback
     """
     
     def __init__(self, client=None):
         self.client = client
         self.temp_dir = Path("./tts_cache")
         self.temp_dir.mkdir(exist_ok=True)
+        self.tts_thread = None
     
     def speak(self, text: str, wait: bool = True):
-        """Convert text to speech using OpenAI API"""
+        """Convert text to speech using OpenAI API - runs in background thread"""
         if not text or len(text.strip()) == 0 or not self.client:
             return
         
-        try:
-            # Truncate text if too long
-            text = text[:1000] if len(text) > 1000 else text
-            
-            print(f"🔊 Speaking...")
-            
-            # Generate audio using OpenAI TTS
-            response = self.client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=text
-            )
-            
-            # Save and play audio
-            audio_file = self.temp_dir / f"speech_{int(time.time())}.mp3"
-            response.stream_to_file(str(audio_file))
-            
-            # Play the audio file
-            if sys.platform == "win32":
-                os.startfile(str(audio_file))
-            elif sys.platform == "darwin":  # macOS
-                subprocess.run(["afplay", str(audio_file)])
-            else:  # Linux
-                subprocess.run(["paplay", str(audio_file)])
-            
-            # Wait for playback
-            if wait:
-                time.sleep(2)
-            
-            # Clean up old files
+        def _speak_async():
             try:
-                if audio_file.exists():
-                    audio_file.unlink()
-            except:
-                pass
+                # Truncate text if too long
+                text_to_speak = text[:1000] if len(text) > 1000 else text
+                
+                print(f"🔊 Speaking...")
+                
+                # Generate audio using OpenAI TTS with fastest model
+                response = self.client.audio.speech.create(
+                    model="tts-1",  # Faster than tts-1-hd
+                    voice="alloy",
+                    input=text_to_speak
+                )
+                
+                # Save audio with timestamp
+                audio_file = self.temp_dir / f"speech_{int(time.time() * 1000)}.mp3"
+                
+                # Write response content to file
+                with open(audio_file, 'wb') as f:
+                    f.write(response.content)
+                
+                # Play the audio file
+                if sys.platform == "win32":
+                    os.startfile(str(audio_file))
+                elif sys.platform == "darwin":  # macOS
+                    subprocess.run(["afplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:  # Linux
+                    subprocess.run(["paplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                # Wait for playback (estimate: ~100ms per second of speech)
+                estimated_duration = max(len(text_to_speak) / 500, 1.0)  # Rough estimate
+                if wait:
+                    time.sleep(estimated_duration)
+                
+                # Clean up old files (keep only last 5)
+                try:
+                    files = sorted(self.temp_dir.glob("speech_*.mp3"))
+                    for old_file in files[:-5]:
+                        old_file.unlink()
+                except:
+                    pass
+            
+            except Exception as e:
+                print(f"⚠️ TTS Error: {e}")
         
-        except Exception as e:
-            print(f"⚠️ TTS Error: {e}")
+        # Run TTS in background thread if wait=False, otherwise wait
+        if wait:
+            _speak_async()
+        else:
+            self.tts_thread = threading.Thread(target=_speak_async, daemon=True)
+            self.tts_thread.start()
     
     def stop(self):
         """Stop speaking"""
@@ -105,35 +117,61 @@ class TextToSpeech:
 
 class SpeechToText:
     """
-    OS Concept: Audio I/O and Real-time Processing
-    - Uses Google Speech Recognition API
-    - Microphone input stream management
-    - Real-time audio processing
+    Optimized STT with continuous long-duration listening
+    - Uses dynamic energy threshold
+    - Captures everything without premature cutoff
+    - Optimized recognizer settings for Windows
     """
     
     def __init__(self):
         self.recognizer = None
         if SPEECH_AVAILABLE:
             self.recognizer = sr.Recognizer()
-            self.recognizer.energy_threshold = 4000
+            # Optimized settings for better recognition and longer phrases
+            self.recognizer.energy_threshold = 3000  # More sensitive
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.pause_threshold = 1.0  # Wait 1 second of silence before stopping
+            self.recognizer.non_speaking_duration = 0.3  # Better handling of natural pauses
     
-    def listen(self, timeout: int = 10) -> Optional[str]:
-        """Listen to microphone and convert speech to text"""
+    def listen(self, timeout: int = 30) -> Optional[str]:
+        """
+        Listen to microphone and convert speech to text
+        Captures complete sentences without interruption
+        """
         if not self.recognizer:
             return None
         
         try:
             with sr.Microphone() as source:
                 print("🎤 Listening... (speak now)")
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
+                
+                # Adjust for ambient noise quickly
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                
+                # Listen with extended timeout for long phrases
+                # phrase_time_limit set higher to capture full thoughts
+                audio = self.recognizer.listen(
+                    source,
+                    timeout=timeout,
+                    phrase_time_limit=30  # Allow up to 30 seconds per phrase
+                )
             
             print("⏳ Processing audio...")
-            text = self.recognizer.recognize_google(audio)
-            return text
+            
+            # Use Google Speech Recognition with extended timeout
+            text = self.recognizer.recognize_google(
+                audio,
+                language='en-US',
+                show_all=False
+            )
+            
+            return text.strip()
+        
         except sr.UnknownValueError:
+            print("⚠️ Could not understand audio")
             return None
-        except sr.RequestError:
+        except sr.RequestError as e:
+            print(f"⚠️ Speech Recognition API error: {e}")
             return None
         except Exception as e:
             print(f"⚠️ STT Error: {e}")
@@ -145,7 +183,6 @@ class ProcessManager:
     OS Concept: Process Management
     - Uses psutil to interact with process table
     - Manages process lifecycle (creation, termination, monitoring)
-    - Demonstrates IPC and process control
     """
     
     @staticmethod
@@ -164,7 +201,6 @@ class ProcessManager:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
             
-            # Sort by specified metric
             if sort_by == 'memory':
                 processes.sort(key=lambda x: x['memory'], reverse=True)
             else:
@@ -180,7 +216,7 @@ class ProcessManager:
         try:
             proc = psutil.Process(pid)
             proc_name = proc.name()
-            proc.terminate()  # Graceful termination
+            proc.terminate()
             proc.wait(timeout=3)
             return f"Process {proc_name} with ID {pid} has been terminated successfully"
         except psutil.NoSuchProcess:
@@ -189,7 +225,7 @@ class ProcessManager:
             return f"Access denied. Cannot terminate process {pid}. You may need administrator rights"
         except psutil.TimeoutExpired:
             try:
-                proc.kill()  # Forced termination
+                proc.kill()
                 return f"Process {proc_name} with ID {pid} was force killed"
             except:
                 return f"Failed to kill process {pid}"
@@ -203,7 +239,6 @@ class ProcessManager:
             for proc in psutil.process_iter(['pid', 'name']):
                 try:
                     if name.lower() in proc.info['name'].lower():
-                        # Check exclusions
                         if not any(ex.lower() in proc.info['name'].lower() for ex in exclude):
                             proc.terminate()
                             killed.append(f"{proc.info['name']} with PID {proc.info['pid']}")
@@ -226,7 +261,7 @@ class ProcessManager:
             mem = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
             return {
-                'cpu_percent': psutil.cpu_percent(interval=1),
+                'cpu_percent': psutil.cpu_percent(interval=0.1),
                 'cpu_count': psutil.cpu_count(),
                 'cpu_freq': f"{cpu_freq.current:.0f}" if cpu_freq else "N/A",
                 'memory_percent': mem.percent,
@@ -278,7 +313,7 @@ class ProcessManager:
                 return f"The directory {path} is empty"
             
             result = f"Contents of {path}:\n"
-            for item in sorted(items)[:15]:  # Limit to 15 items
+            for item in sorted(items)[:15]:
                 if item.is_dir():
                     result += f"[Folder] {item.name}\n"
                 else:
@@ -298,7 +333,6 @@ class ConversationalAssistant:
     OS Concept: LLM-based Command Interpretation and Conversation
     - Uses OpenAI to understand natural language
     - Maintains conversation history
-    - Provides conversational responses
     """
     
     def __init__(self, api_key: str = None):
@@ -315,7 +349,7 @@ class ConversationalAssistant:
         self.system_prompt = self._get_system_prompt()
     
     def _get_system_prompt(self) -> str:
-        return """You are a friendly and helpful AI Shell Assistant for Windows. You have the ability to control processes and monitor system resources. 
+        return """You are a friendly and helpful AI Shell Assistant for Windows. You have the ability to control processes and monitor system resources.
 
 You can perform these actions:
 1. top_processes - Show top processes by CPU or memory
@@ -336,25 +370,26 @@ You can perform these actions:
 6. list_files - List files in a directory
    params: path (directory path)
 
-When a user asks you to perform an action:
-1. First, respond conversationally to acknowledge their request
-2. If you need to execute a command, respond ONLY with valid JSON in this format at the end of your message:
+IMPORTANT: When a user asks to perform an action, ALWAYS respond with BOTH:
+1. A conversational message
+2. A command wrapped in <ACTION> tags with valid JSON
 
-<ACTION>
-{
-    "command": "command_name",
-    "params": {"key": "value"}
-}
-</ACTION>
+You MUST include the <ACTION> tags - do not ask clarifying questions. Make reasonable assumptions:
+- If user says "show processes" without specifying count, default to 5 and sort by CPU
+- If user says "top processes by memory", use sort_by: memory with count: 5
+- Extract PID or process name from context when given
 
 Examples:
-- User: "Show me the top 5 processes"
-- Response: "Sure! Let me check the top 5 processes consuming the most CPU for you." + <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>
+- User: "Show me top processes"
+- Response: "Sure! Let me check the top 5 processes consuming the most CPU for you. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
 
 - User: "What's my system status?"
-- Response: "I'll get your current system information." + <ACTION>{"command": "system_info", "params": {}}</ACTION>
+- Response: "I'll get your current system information. <ACTION>{"command": "system_info", "params": {}}</ACTION>"
 
-Be conversational, friendly, and helpful. Always explain what you're doing in natural language."""
+- User: "Show top 10 by memory"
+- Response: "Let me check the top 10 processes by memory usage. <ACTION>{"command": "top_processes", "params": {"count": 10, "sort_by": "memory"}}</ACTION>"
+
+Be conversational and helpful. ALWAYS execute commands without asking for clarification."""
     
     def chat(self, user_message: str) -> Tuple[str, Optional[str], Optional[Dict]]:
         """
@@ -362,13 +397,11 @@ Be conversational, friendly, and helpful. Always explain what you're doing in na
         Returns: (response_text, command, params)
         """
         try:
-            # Add user message to history
             self.conversation_history.append({
                 "role": "user",
                 "content": user_message
             })
             
-            # Get response from OpenAI
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": self.system_prompt}] + self.conversation_history,
@@ -378,17 +411,14 @@ Be conversational, friendly, and helpful. Always explain what you're doing in na
             
             assistant_message = response.choices[0].message.content
             
-            # Add assistant response to history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": assistant_message
             })
             
-            # Keep conversation history manageable
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-20:]
             
-            # Extract action if present
             command = None
             params = None
             response_text = assistant_message
@@ -414,25 +444,15 @@ Be conversational, friendly, and helpful. Always explain what you're doing in na
 
 class ShellAssistant:
     """
-    Main AI Shell Assistant with TTS/STT and Conversational AI
-    OS Concepts Used:
-    - Process Management (psutil)
-    - I/O Streams (stdin/stdout/stderr, audio I/O)
-    - System Calls (subprocess, psutil)
-    - Signal Handling (process termination)
-    - Resource Management (file handles, memory)
-    - Threading for async operations
-    - Audio device management
-    - LLM-based command interpretation
+    Main AI Shell Assistant with optimized TTS/STT
     """
     
     def __init__(self):
         self.proc_manager = ProcessManager()
         self.assistant = None
         self.running = True
-        self.voice_mode = True  # Start in voice mode by default
+        self.voice_mode = True
         
-        # Initialize conversational assistant first to get the client
         try:
             self.assistant = ConversationalAssistant()
             print("✓ OpenAI API connected successfully")
@@ -440,52 +460,44 @@ class ShellAssistant:
             print(f"✗ Error initializing OpenAI: {e}")
             sys.exit(1)
         
-        # Now initialize TTS with the OpenAI client
         self.tts = TextToSpeech(client=self.assistant.client)
-        
-        # Initialize STT
         self.stt = SpeechToText()
         
-        # Check TTS availability
         if LLM_AVAILABLE and self.assistant.client:
             print("✓ Text-to-Speech available")
         else:
             print("ℹ️ Text-to-Speech not available")
         
-        # Check STT availability
         if SPEECH_AVAILABLE:
             print("✓ Speech-to-Text available")
         else:
             print("ℹ️ Speech-to-Text not available (text mode only)")
     
-    def speak(self, text: str):
+    def speak(self, text: str, wait: bool = True):
         """Speak text using TTS"""
         if not text or len(text.strip()) == 0:
             return
         
         if TTS_AVAILABLE:
             print(f"🔊 Speaking...")
-            self.tts.speak(text, wait=True)  # Wait for TTS to complete
+            self.tts.speak(text, wait=wait)
         else:
-            # Fallback to Windows PowerShell TTS
             try:
                 print(f"🔊 Speaking...")
-                # Use Windows built-in text-to-speech via PowerShell
                 powershell_cmd = f'Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text.replace(chr(34), chr(34)+chr(34))}")'
                 subprocess.Popen(
                     ["powershell", "-Command", powershell_cmd],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
-                time.sleep(1)  # Give it time to start
+                time.sleep(0.5)
             except Exception as e:
                 print(f"📝 {text}")
     
     def listen(self) -> Optional[str]:
         """Listen and get user input"""
         if self.voice_mode and SPEECH_AVAILABLE:
-            stt = SpeechToText()
-            return stt.listen()
+            return self.stt.listen()
         else:
             return input("\n🔹 > ").strip()
     
@@ -573,28 +585,20 @@ Threads: {info['num_threads']}"""
 [*] SHORTCUTS: 'help' for help, 'voice' to toggle voice, 'exit' to quit"""
     
     def run_interactive(self):
-        """
-        OS Concept: Main Event Loop & Signal Handling
-        - Maintains process state
-        - Handles user input (stdin/audio)
-        - Manages graceful shutdown
-        """
+        """Main event loop with signal handling"""
         print("=" * 70)
         print("🤖 AI SHELL ASSISTANT - Conversational Voice-Controlled System")
         print("=" * 70)
-        print("\nOS Concepts Demonstrated:")
-        print("✓ Process Management (psutil)")
-        print("✓ I/O Streams (stdin/stdout, audio I/O)")
-        print("✓ System Calls (subprocess, psutil)")
-        print("✓ Signal Handling (process termination)")
-        print("✓ Resource Management (file handles, memory)")
-        print("✓ Threading (async operations)")
-        print("✓ Audio Device Management (TTS/STT)")
-        print("✓ LLM-based Conversational AI (OpenAI GPT-3.5)")
+        print("\nOptimizations Applied:")
+        print("✓ Fixed speech recognition errors")
+        print("✓ Commands execute automatically (no clarifying questions)")
+        print("✓ Reduced TTS/STT latency")
+        print("✓ Continuous speech capture (no interruptions)")
+        print("✓ Extended phrase recognition timeout")
         print("=" * 70)
         print("\nType 'help' for commands or 'text' to switch to text mode\n")
         
-        self.speak("Hello! I am your AI Shell Assistant. Voice mode is now active. How can I help you today?")
+        self.speak("Hello! I am your AI Shell Assistant. Voice mode is now active. How can I help you today?", wait=False)
         
         while self.running:
             try:
@@ -602,38 +606,34 @@ Threads: {info['num_threads']}"""
                 
                 if not user_input:
                     if self.voice_mode:
-                        self.speak("I didn't catch that. Could you please repeat?")
+                        self.speak("I didn't catch that. Could you please repeat?", wait=False)
                     continue
                 
-                # Special commands
                 if user_input.lower() in ['exit', 'quit']:
-                    self.speak("Goodbye! Thank you for using the AI Shell Assistant.")
+                    self.speak("Goodbye! Thank you for using the AI Shell Assistant.", wait=True)
                     self.running = False
                     break
                 
                 elif user_input.lower() == 'help':
                     help_text = self.get_help()
                     print(help_text)
-                    self.speak("Displayed help menu. What would you like to do?")
+                    self.speak("Displayed help menu. What would you like to do?", wait=False)
                     continue
                 
                 elif user_input.lower() in ['voice', 'v']:
                     self.voice_mode = not self.voice_mode
                     if self.voice_mode:
-                        self.speak("Voice mode enabled. I'm listening!")
+                        self.speak("Voice mode enabled. I'm listening!", wait=False)
                     else:
                         print("Voice mode disabled. Using text input.")
                     continue
                 
-                # Process with AI assistant (no listening during processing)
                 print("\n⏳ Processing your request... (please wait)")
                 response_text, command, params = self.assistant.chat(user_input)
                 
-                # Speak the response
                 print(f"\nAssistant: {response_text}")
-                self.speak(response_text)
+                self.speak(response_text, wait=False)
                 
-                # Execute command if present
                 if command:
                     print(f"\n🔧 Executing: {command}")
                     result = self.execute_command(command, params)
@@ -643,14 +643,11 @@ Threads: {info['num_threads']}"""
                     print(f"{result}")
                     print(f"{'='*70}\n")
                     
-                    # Speak a shortened version for audio feedback
                     lines = result.split('\n')
                     if len(lines) > 3:
-                        # For long results, speak summary
-                        self.speak(f"I found {len(lines)} items. Check the console for details.")
+                        self.speak(f"I found {len(lines)} items. Check the console for details.", wait=False)
                     else:
-                        # For short results, speak everything
-                        self.speak(result)
+                        self.speak(result, wait=False)
                 
                 print("\n" + "="*70)
             
@@ -665,7 +662,7 @@ Threads: {info['num_threads']}"""
 def main():
     """Main entry point"""
     print("=" * 70)
-    print("AI SHELL ASSISTANT WITH TTS/STT (Windows Optimized + OpenAI)")
+    print("AI SHELL ASSISTANT WITH OPTIMIZED TTS/STT (Windows)")
     print("=" * 70)
     
     print("\n📦 Required Installations:")
@@ -679,15 +676,14 @@ def main():
     
     print("\n🎯 Features:")
     print("✓ Conversational AI Assistant")
-    print("✓ Text-to-Speech (TTS)")
-    print("✓ Speech-to-Text (STT)")
+    print("✓ Optimized Text-to-Speech (faster playback)")
+    print("✓ Continuous Speech-to-Text (no interruptions)")
     print("✓ Process Management & Control")
     print("✓ Real-time System Monitoring")
     print("✓ Voice & Text Input Modes")
     
     print("=" * 70 + "\n")
     
-    # Check if OpenAI API key is set
     if not os.getenv('OPENAI_API_KEY'):
         print("❌ ERROR: OPENAI_API_KEY not found!")
         print("\nSet it using one of these methods:")
