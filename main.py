@@ -1,6 +1,6 @@
 """
 Voice-Controlled AI Shell Assistant for Windows with OpenAI Integration
-Optimized for reduced latency and continuous speech capture
+Optimized for rate limiting and reduced TTS calls
 """
 
 import os
@@ -42,9 +42,10 @@ except ImportError:
 
 class TextToSpeech:
     """
-    Optimized TTS with parallel processing
-    - Uses threading to avoid blocking
-    - Streams audio directly for faster playback
+    Optimized TTS with rate limiting and caching
+    - Implements request throttling
+    - Caches common responses
+    - Handles rate limit errors gracefully
     """
     
     def __init__(self, client=None):
@@ -52,22 +53,42 @@ class TextToSpeech:
         self.temp_dir = Path("./tts_cache")
         self.temp_dir.mkdir(exist_ok=True)
         self.tts_thread = None
+        self.last_request_time = 0
+        self.min_interval = 0.5  # Minimum 0.5 seconds between TTS requests
+        self.cache = {}
     
-    def speak(self, text: str, wait: bool = True):
-        """Convert text to speech using OpenAI API - runs in background thread"""
+    def speak(self, text: str, wait: bool = True, force: bool = False):
+        """Convert text to speech using OpenAI API with rate limiting"""
         if not text or len(text.strip()) == 0 or not self.client:
+            return
+        
+        # Skip short acknowledgments if not forced
+        if not force and len(text) < 10:
             return
         
         def _speak_async():
             try:
+                # Rate limiting: wait if needed
+                time_since_last = time.time() - self.last_request_time
+                if time_since_last < self.min_interval:
+                    time.sleep(self.min_interval - time_since_last)
+                
                 # Truncate text if too long
                 text_to_speak = text[:1000] if len(text) > 1000 else text
                 
+                # Check cache
+                cache_key = hash(text_to_speak)
+                if cache_key in self.cache:
+                    audio_file = self.cache[cache_key]
+                    if audio_file.exists():
+                        self._play_audio(audio_file)
+                        return
+                
                 print(f"🔊 Speaking...")
                 
-                # Generate audio using OpenAI TTS with fastest model
+                # Generate audio using OpenAI TTS
                 response = self.client.audio.speech.create(
-                    model="tts-1",  # Faster than tts-1-hd
+                    model="tts-1",
                     voice="alloy",
                     input=text_to_speak
                 )
@@ -79,36 +100,53 @@ class TextToSpeech:
                 with open(audio_file, 'wb') as f:
                     f.write(response.content)
                 
-                # Play the audio file
-                if sys.platform == "win32":
-                    os.startfile(str(audio_file))
-                elif sys.platform == "darwin":  # macOS
-                    subprocess.run(["afplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else:  # Linux
-                    subprocess.run(["paplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Cache it
+                self.cache[cache_key] = audio_file
                 
-                # Wait for playback (estimate: ~100ms per second of speech)
-                estimated_duration = max(len(text_to_speak) / 500, 1.0)  # Rough estimate
-                if wait:
-                    time.sleep(estimated_duration)
+                # Play audio
+                self._play_audio(audio_file)
                 
-                # Clean up old files (keep only last 5)
+                # Update last request time
+                self.last_request_time = time.time()
+                
+                # Clean up old files (keep only last 10)
                 try:
                     files = sorted(self.temp_dir.glob("speech_*.mp3"))
-                    for old_file in files[:-5]:
+                    for old_file in files[:-10]:
                         old_file.unlink()
                 except:
                     pass
             
             except Exception as e:
-                print(f"⚠️ TTS Error: {e}")
+                if "429" in str(e) or "rate_limit" in str(e).lower():
+                    print(f"⚠️ Rate limit reached. Waiting before retry...")
+                    time.sleep(25)  # Wait 25 seconds for rate limit to reset
+                else:
+                    print(f"⚠️ TTS Error: {e}")
         
-        # Run TTS in background thread if wait=False, otherwise wait
-        if wait:
-            _speak_async()
-        else:
-            self.tts_thread = threading.Thread(target=_speak_async, daemon=True)
-            self.tts_thread.start()
+        # Run TTS in background thread
+        self.tts_thread = threading.Thread(target=_speak_async, daemon=True)
+        self.tts_thread.start()
+        
+        # Optionally wait for completion
+        if wait and self.tts_thread:
+            self.tts_thread.join(timeout=10)
+    
+    def _play_audio(self, audio_file: Path):
+        """Play audio file"""
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(audio_file))
+            elif sys.platform == "darwin":  # macOS
+                subprocess.run(["afplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:  # Linux
+                subprocess.run(["paplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Estimate duration and wait
+            estimated_duration = 2.0
+            time.sleep(estimated_duration)
+        except Exception as e:
+            print(f"⚠️ Audio playback error: {e}")
     
     def stop(self):
         """Stop speaking"""
@@ -118,26 +156,19 @@ class TextToSpeech:
 class SpeechToText:
     """
     Optimized STT with continuous long-duration listening
-    - Uses dynamic energy threshold
-    - Captures everything without premature cutoff
-    - Optimized recognizer settings for Windows
     """
     
     def __init__(self):
         self.recognizer = None
         if SPEECH_AVAILABLE:
             self.recognizer = sr.Recognizer()
-            # Optimized settings for better recognition and longer phrases
-            self.recognizer.energy_threshold = 3000  # More sensitive
+            self.recognizer.energy_threshold = 3000
             self.recognizer.dynamic_energy_threshold = True
-            self.recognizer.pause_threshold = 1.0  # Wait 1 second of silence before stopping
-            self.recognizer.non_speaking_duration = 0.3  # Better handling of natural pauses
+            self.recognizer.pause_threshold = 1.0
+            self.recognizer.non_speaking_duration = 0.3
     
     def listen(self, timeout: int = 30) -> Optional[str]:
-        """
-        Listen to microphone and convert speech to text
-        Captures complete sentences without interruption
-        """
+        """Listen to microphone and convert speech to text"""
         if not self.recognizer:
             return None
         
@@ -145,20 +176,16 @@ class SpeechToText:
             with sr.Microphone() as source:
                 print("🎤 Listening... (speak now)")
                 
-                # Adjust for ambient noise quickly
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
                 
-                # Listen with extended timeout for long phrases
-                # phrase_time_limit set higher to capture full thoughts
                 audio = self.recognizer.listen(
                     source,
                     timeout=timeout,
-                    phrase_time_limit=30  # Allow up to 30 seconds per phrase
+                    phrase_time_limit=30
                 )
             
             print("⏳ Processing audio...")
             
-            # Use Google Speech Recognition with extended timeout
             text = self.recognizer.recognize_google(
                 audio,
                 language='en-US',
@@ -179,11 +206,7 @@ class SpeechToText:
 
 
 class ProcessManager:
-    """
-    OS Concept: Process Management
-    - Uses psutil to interact with process table
-    - Manages process lifecycle (creation, termination, monitoring)
-    """
+    """Process Management using psutil"""
     
     @staticmethod
     def get_top_processes(n: int = 5, sort_by: str = 'cpu') -> List[Dict]:
@@ -329,11 +352,7 @@ class ProcessManager:
 
 
 class ConversationalAssistant:
-    """
-    OS Concept: LLM-based Command Interpretation and Conversation
-    - Uses OpenAI to understand natural language
-    - Maintains conversation history
-    """
+    """LLM-based Command Interpretation"""
     
     def __init__(self, api_key: str = None):
         if not LLM_AVAILABLE:
@@ -370,32 +389,25 @@ You can perform these actions:
 6. list_files - List files in a directory
    params: path (directory path)
 
-IMPORTANT: When a user asks to perform an action, ALWAYS respond with BOTH:
-1. A conversational message
-2. A command wrapped in <ACTION> tags with valid JSON
-
-You MUST include the <ACTION> tags - do not ask clarifying questions. Make reasonable assumptions:
-- If user says "show processes" without specifying count, default to 5 and sort by CPU
-- If user says "top processes by memory", use sort_by: memory with count: 5
-- Extract PID or process name from context when given
+CRITICAL RULES:
+- ALWAYS respond with BOTH a conversational message AND a command in <ACTION> tags
+- NEVER ask clarifying questions - make reasonable assumptions and execute immediately
+- ALWAYS extract numbers (PIDs, counts) from speech even if partially heard
+- Extract any number mentioned as a PID for kill commands
+- If user says a number alone or with "kill", treat as PID to terminate
+- Keep responses SHORT (under 10 words)
 
 Examples:
-- User: "Show me top processes"
-- Response: "Sure! Let me check the top 5 processes consuming the most CPU for you. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
+- User: "top processes" → Response: "Checking now. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
+- User: "show memory" → Response: "Checking memory. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "memory"}}</ACTION>"
+- User: "kill 712" → Response: "Terminating process 712. <ACTION>{"command": "kill_process", "params": {"pid": 712}}</ACTION>"
+- User: "system info" → Response: "Getting info. <ACTION>{"command": "system_info", "params": {}}</ACTION>"
 
-- User: "What's my system status?"
-- Response: "I'll get your current system information. <ACTION>{"command": "system_info", "params": {}}</ACTION>"
-
-- User: "Show top 10 by memory"
-- Response: "Let me check the top 10 processes by memory usage. <ACTION>{"command": "top_processes", "params": {"count": 10, "sort_by": "memory"}}</ACTION>"
-
-Be conversational and helpful. ALWAYS execute commands without asking for clarification."""
+Always execute commands - no exceptions, no clarifications needed."""
+    
     
     def chat(self, user_message: str) -> Tuple[str, Optional[str], Optional[Dict]]:
-        """
-        Process user message and generate response
-        Returns: (response_text, command, params)
-        """
+        """Process user message and generate response"""
         try:
             self.conversation_history.append({
                 "role": "user",
@@ -406,7 +418,7 @@ Be conversational and helpful. ALWAYS execute commands without asking for clarif
                 model=self.model,
                 messages=[{"role": "system", "content": self.system_prompt}] + self.conversation_history,
                 temperature=0.7,
-                max_tokens=500
+                max_tokens=200  # Reduced from 500 to encourage brevity
             )
             
             assistant_message = response.choices[0].message.content
@@ -439,19 +451,19 @@ Be conversational and helpful. ALWAYS execute commands without asking for clarif
             return response_text, command, params
         
         except Exception as e:
-            return f"I encountered an error: {str(e)}", None, None
+            return f"Error: {str(e)}", None, None
 
 
 class ShellAssistant:
-    """
-    Main AI Shell Assistant with optimized TTS/STT
-    """
+    """Main AI Shell Assistant"""
     
     def __init__(self):
         self.proc_manager = ProcessManager()
         self.assistant = None
         self.running = True
         self.voice_mode = True
+        self.speaking = False  # Track if currently speaking
+        self.last_voice_output = ""  # Store what to speak
         
         try:
             self.assistant = ConversationalAssistant()
@@ -473,26 +485,18 @@ class ShellAssistant:
         else:
             print("ℹ️ Speech-to-Text not available (text mode only)")
     
-    def speak(self, text: str, wait: bool = True):
-        """Speak text using TTS"""
+    def speak(self, text: str, wait: bool = True, force: bool = False):
+        """Speak text using TTS - blocks until complete by default"""
         if not text or len(text.strip()) == 0:
             return
         
-        if TTS_AVAILABLE:
+        if TTS_AVAILABLE and (force or len(text) > 15):
             print(f"🔊 Speaking...")
-            self.tts.speak(text, wait=wait)
+            self.tts.speak(text, wait=wait, force=force)
+            time.sleep(2)  # Ensure speech completes before listening
         else:
-            try:
-                print(f"🔊 Speaking...")
-                powershell_cmd = f'Add-Type -AssemblyName System.speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text.replace(chr(34), chr(34)+chr(34))}")'
-                subprocess.Popen(
-                    ["powershell", "-Command", powershell_cmd],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"📝 {text}")
+            print(f"📝 {text}")
+            time.sleep(1)
     
     def listen(self) -> Optional[str]:
         """Listen and get user input"""
@@ -538,10 +542,8 @@ class ShellAssistant:
                 
                 result = f"""System Information:
 CPU Usage: {info['cpu_percent']}%
-CPU Cores: {info['cpu_count']}
-CPU Frequency: {info['cpu_freq']} MHz
-Memory Usage: {info['memory_percent']}% ({info['memory_used']:.2f} GB of {info['memory_total']:.2f} GB)
-Disk Usage: {info['disk_percent']}% ({info['disk_used']:.2f} GB of {info['disk_total']:.2f} GB)
+Memory Usage: {info['memory_percent']}% ({info['memory_used']:.2f}/{info['memory_total']:.2f} GB)
+Disk Usage: {info['disk_percent']}%
 Active Processes: {info['process_count']}"""
                 return result
             
@@ -552,21 +554,13 @@ Active Processes: {info['process_count']}"""
                     if 'error' in info:
                         return f"Error: {info['error']}"
                     
-                    result = f"""Process Information for PID {pid}:
-Name: {info['name']}
-Status: {info['status']}
-CPU Usage: {info['cpu_percent']}%
-Memory: {info['memory_mb']:.2f} MB
-Threads: {info['num_threads']}"""
+                    result = f"Process: {info['name']} (PID {pid})\nCPU: {info['cpu_percent']}% | Memory: {info['memory_mb']:.1f} MB"
                     return result
                 return "Please specify a PID"
             
             elif cmd_type == 'list_files':
                 path = params.get('path', '.')
                 return self.proc_manager.list_files(path)
-            
-            elif cmd_type == 'help':
-                return self.get_help()
             
             else:
                 return f"Unknown command: {cmd_type}"
@@ -576,29 +570,28 @@ Threads: {info['num_threads']}"""
     
     def get_help(self) -> str:
         """Display available commands"""
-        return r"""Available Commands:
-[*] PROCESS MANAGEMENT: Show me top processes, Top 10 by memory, Process info for PID
-[!] PROCESS CONTROL: Kill process [PID], Kill all Python tasks, Kill Chrome except localhost
-[*] SYSTEM MONITORING: System info, CPU usage, RAM usage, Disk space
-[*] FILE OPERATIONS: List files, Show desktop, List C:\Users
-[*] VOICE MODE: Press 'v' to enable voice control
-[*] SHORTCUTS: 'help' for help, 'voice' to toggle voice, 'exit' to quit"""
+        return """Available Commands:
+[*] Show top processes / Show top processes by memory
+[!] Kill process [PID] / Kill [process name]
+[*] System info / What's my CPU usage
+[*] List files / List C:\\Users
+[*] 'v' to toggle voice, 'help' for help, 'exit' to quit"""
     
     def run_interactive(self):
-        """Main event loop with signal handling"""
+        """Main event loop"""
         print("=" * 70)
-        print("🤖 AI SHELL ASSISTANT - Conversational Voice-Controlled System")
+        print("AI SHELL ASSISTANT - Optimized for Rate Limits")
         print("=" * 70)
-        print("\nOptimizations Applied:")
-        print("✓ Fixed speech recognition errors")
-        print("✓ Commands execute automatically (no clarifying questions)")
-        print("✓ Reduced TTS/STT latency")
-        print("✓ Continuous speech capture (no interruptions)")
-        print("✓ Extended phrase recognition timeout")
+        print("\nOptimizations:")
+        print("✓ Rate limit handling (25s wait on 429)")
+        print("✓ TTS request throttling (0.5s minimum between calls)")
+        print("✓ Response caching")
+        print("✓ Brief responses to reduce API costs")
+        print("✓ Only TTS for command results (not confirmations)")
         print("=" * 70)
-        print("\nType 'help' for commands or 'text' to switch to text mode\n")
+        print("\nType 'help' for commands\n")
         
-        self.speak("Hello! I am your AI Shell Assistant. Voice mode is now active. How can I help you today?", wait=False)
+        self.speak("Hello! AI Shell Assistant ready.", force=True)
         
         while self.running:
             try:
@@ -606,96 +599,72 @@ Threads: {info['num_threads']}"""
                 
                 if not user_input:
                     if self.voice_mode:
-                        self.speak("I didn't catch that. Could you please repeat?", wait=False)
+                        self.speak("Sorry, didn't catch that. Try again.", force=True)
                     continue
                 
                 if user_input.lower() in ['exit', 'quit']:
-                    self.speak("Goodbye! Thank you for using the AI Shell Assistant.", wait=True)
+                    self.speak("Goodbye!", force=True)
                     self.running = False
                     break
                 
                 elif user_input.lower() == 'help':
                     help_text = self.get_help()
                     print(help_text)
-                    self.speak("Displayed help menu. What would you like to do?", wait=False)
                     continue
                 
                 elif user_input.lower() in ['voice', 'v']:
                     self.voice_mode = not self.voice_mode
-                    if self.voice_mode:
-                        self.speak("Voice mode enabled. I'm listening!", wait=False)
-                    else:
-                        print("Voice mode disabled. Using text input.")
+                    mode = "enabled" if self.voice_mode else "disabled"
+                    print(f"Voice mode {mode}")
                     continue
                 
-                print("\n⏳ Processing your request... (please wait)")
+                print("\n⏳ Processing...")
                 response_text, command, params = self.assistant.chat(user_input)
                 
-                print(f"\nAssistant: {response_text}")
-                self.speak(response_text, wait=False)
+                if response_text:
+                    print(f"Assistant: {response_text}")
                 
                 if command:
-                    print(f"\n🔧 Executing: {command}")
+                    print(f"🔧 Executing: {command}")
                     result = self.execute_command(command, params)
-                    print(f"\n{'='*70}")
-                    print("COMMAND RESULTS:")
-                    print(f"{'='*70}")
-                    print(f"{result}")
-                    print(f"{'='*70}\n")
+                    print(f"\n{result}\n")
                     
-                    lines = result.split('\n')
-                    if len(lines) > 3:
-                        self.speak(f"I found {len(lines)} items. Check the console for details.", wait=False)
-                    else:
-                        self.speak(result, wait=False)
-                
-                print("\n" + "="*70)
+                    # Speak summarized version for process commands
+                    if command == 'top_processes' and self.last_voice_output:
+                        self.speak(self.last_voice_output, wait=True, force=True)
+                        self.last_voice_output = ""
+                    # Speak brief results for other commands
+                    elif command in ['kill_process', 'kill_by_name', 'system_info']:
+                        # Only speak if result is short enough and not an error
+                        if "Error" not in result and len(result) < 100:
+                            self.speak(result, wait=True, force=True)
+                        elif "Error" in result:
+                            print(f"⚠️ {result}")
             
             except KeyboardInterrupt:
-                print("\n\n")
+                print("\n")
                 self.running = False
             except Exception as e:
-                error_msg = f"An error occurred: {str(e)}"
-                print(f"❌ {error_msg}")
+                print(f"Error: {str(e)}")
 
 
 def main():
     """Main entry point"""
     print("=" * 70)
-    print("AI SHELL ASSISTANT WITH OPTIMIZED TTS/STT (Windows)")
+    print("AI SHELL ASSISTANT (Rate-Limited & Optimized)")
     print("=" * 70)
-    
-    print("\n📦 Required Installations:")
-    print("pip install psutil SpeechRecognition pydub pyaudio python-dotenv openai")
-    
-    print("\n🔑 Setup:")
-    print("1. Set OPENAI_API_KEY environment variable or create .env file")
-    print("   .env file content: OPENAI_API_KEY=sk-...")
-    print("2. Install all requirements above")
-    print("3. Run this script")
-    
-    print("\n🎯 Features:")
-    print("✓ Conversational AI Assistant")
-    print("✓ Optimized Text-to-Speech (faster playback)")
-    print("✓ Continuous Speech-to-Text (no interruptions)")
-    print("✓ Process Management & Control")
-    print("✓ Real-time System Monitoring")
-    print("✓ Voice & Text Input Modes")
-    
-    print("=" * 70 + "\n")
+    print("\nRequired: pip install psutil SpeechRecognition pydub pyaudio python-dotenv openai")
+    print("Setup: Set OPENAI_API_KEY environment variable\n")
     
     if not os.getenv('OPENAI_API_KEY'):
-        print("❌ ERROR: OPENAI_API_KEY not found!")
-        print("\nSet it using one of these methods:")
-        print("1. Environment variable: set OPENAI_API_KEY=sk-...")
-        print("2. Create .env file with: OPENAI_API_KEY=sk-...")
+        print("ERROR: OPENAI_API_KEY not set!")
         sys.exit(1)
     
     try:
         assistant = ShellAssistant()
         assistant.run_interactive()
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"Fatal error: {e}")
         sys.exit(1)
 
 
