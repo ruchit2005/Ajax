@@ -62,6 +62,10 @@ class TextToSpeech:
         if not text or len(text.strip()) == 0 or not self.client:
             return
         
+        # Skip short acknowledgments if not forced
+        if not force and len(text) < 10:
+            return
+        
         def _speak_async():
             try:
                 # Rate limiting: wait if needed
@@ -120,41 +124,27 @@ class TextToSpeech:
                 else:
                     print(f"⚠️ TTS Error: {e}")
         
-        # Run TTS synchronously if wait=True, otherwise in background
-        if wait:
-            _speak_async()
-        else:
-            self.tts_thread = threading.Thread(target=_speak_async, daemon=False)
-            self.tts_thread.start()
+        # Run TTS in background thread
+        self.tts_thread = threading.Thread(target=_speak_async, daemon=True)
+        self.tts_thread.start()
+        
+        # Optionally wait for completion
+        if wait and self.tts_thread:
+            self.tts_thread.join(timeout=10)
     
     def _play_audio(self, audio_file: Path):
         """Play audio file"""
         try:
             if sys.platform == "win32":
-                # Use pygame for reliable MP3 playback on Windows
-                try:
-                    import pygame
-                    pygame.mixer.init()
-                    pygame.mixer.music.load(str(audio_file))
-                    pygame.mixer.music.play()
-                    
-                    # Wait for playback to complete
-                    while pygame.mixer.music.get_busy():
-                        time.sleep(0.1)
-                    
-                    pygame.mixer.quit()
-                except ImportError:
-                    # Fallback: use os.startfile with wait time
-                    os.startfile(str(audio_file))
-                    # Estimate wait time based on file size
-                    file_size = audio_file.stat().st_size
-                    wait_time = max(2, file_size / 10000)  # Rough estimate
-                    time.sleep(wait_time)
+                os.startfile(str(audio_file))
             elif sys.platform == "darwin":  # macOS
                 subprocess.run(["afplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:  # Linux
                 subprocess.run(["paplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
+            # Estimate duration and wait
+            estimated_duration = 2.0
+            time.sleep(estimated_duration)
         except Exception as e:
             print(f"⚠️ Audio playback error: {e}")
     
@@ -174,9 +164,8 @@ class SpeechToText:
             self.recognizer = sr.Recognizer()
             self.recognizer.energy_threshold = 3000
             self.recognizer.dynamic_energy_threshold = True
-            self.recognizer.pause_threshold = 0.5  # Reduced to catch end of numbers faster
-            self.recognizer.non_speaking_duration = 0.5  # Wait longer for continuation
-            self.recognizer.phrase_threshold = 0.1  # Minimum seconds of speaking required
+            self.recognizer.pause_threshold = 1.0
+            self.recognizer.non_speaking_duration = 0.3
     
     def listen(self, timeout: int = 30) -> Optional[str]:
         """Listen to microphone and convert speech to text"""
@@ -187,8 +176,7 @@ class SpeechToText:
             with sr.Microphone() as source:
                 print("🎤 Listening... (speak now)")
                 
-                # Adjust for ambient noise with longer duration for better calibration
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
                 
                 audio = self.recognizer.listen(
                     source,
@@ -198,49 +186,22 @@ class SpeechToText:
             
             print("⏳ Processing audio...")
             
-            # Try to get more complete transcription by requesting alternatives
-            response = self.recognizer.recognize_google(
+            text = self.recognizer.recognize_google(
                 audio,
                 language='en-US',
-                show_all=True  # Get all alternatives to pick the best one
+                show_all=False
             )
             
-            # Parse response - it returns a dict with alternatives
-            if isinstance(response, dict) and 'alternative' in response:
-                alternatives = response['alternative']
-                
-                # Pick the alternative with the longest numbers (more complete)
-                best_transcript = ""
-                max_number_length = 0
-                
-                for alt in alternatives:
-                    transcript = alt.get('transcript', '')
-                    numbers = re.findall(r'\d+', transcript)
-                    total_number_length = sum(len(n) for n in numbers)
-                    
-                    if total_number_length > max_number_length:
-                        max_number_length = total_number_length
-                        best_transcript = transcript
-                
-                result = best_transcript.strip() if best_transcript else alternatives[0].get('transcript', '').strip()
-            else:
-                # Fallback to simple string result
-                result = str(response).strip() if response else ""
-            
-            # Show transcription with detected PIDs highlighted
-            pids = re.findall(r'\b(\d{2,6})\b', result)
-            if pids:
-                print(f"📝 Transcription: \"{result}\" [PIDs detected: {', '.join(pids)}]")
-            else:
-                print(f"📝 Transcription: \"{result}\"")
-            
-            return result
+            return text.strip()
         
         except sr.UnknownValueError:
+            print("⚠️ Could not understand audio")
             return None
         except sr.RequestError as e:
+            print(f"⚠️ Speech Recognition API error: {e}")
             return None
         except Exception as e:
+            print(f"⚠️ STT Error: {e}")
             return None
 
 
@@ -428,44 +389,26 @@ You can perform these actions:
 6. list_files - List files in a directory
    params: path (directory path)
 
-CRITICAL RULES FOR PID EXTRACTION:
-- When you see [PID detected: NUMBER] in the user message, USE THAT EXACT NUMBER
-- Look for numbers in patterns like: "kill 1234", "terminate 1234", "stop 1234", "process 1234", "1234"
-- Extract ALL digits spoken - don't truncate or modify the number
-- If speech recognition may have cut off digits, use the [PID detected:] hint provided
-- NEVER use fake/placeholder PIDs - only use numbers actually detected in user message
-- If no valid PID is in the message, show top_processes first
-
-Keep responses SHORT (under 10 words).
+CRITICAL RULES:
+- ALWAYS respond with BOTH a conversational message AND a command in <ACTION> tags
+- NEVER ask clarifying questions - make reasonable assumptions and execute immediately
+- ALWAYS extract numbers (PIDs, counts) from speech even if partially heard
+- Extract any number mentioned as a PID for kill commands
+- If user says a number alone or with "kill", treat as PID to terminate
+- Keep responses SHORT (under 10 words)
 
 Examples:
-- User: "top processes" → "Checking now. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
-- User: "kill 21808" → "Terminating 21808. <ACTION>{"command": "kill_process", "params": {"pid": 21808}}</ACTION>"
-- User: "terminate 33384" → "Stopping 33384. <ACTION>{"command": "kill_process", "params": {"pid": 33384}}</ACTION>"
-- User: "kill python" → "Killing python. <ACTION>{"command": "kill_by_name", "params": {"name": "python"}}</ACTION>"
-- User: "28764" → "Terminating 28764. <ACTION>{"command": "kill_process", "params": {"pid": 28764}}</ACTION>"
+- User: "top processes" → Response: "Checking now. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
+- User: "show memory" → Response: "Checking memory. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "memory"}}</ACTION>"
+- User: "kill 712" → Response: "Terminating process 712. <ACTION>{"command": "kill_process", "params": {"pid": 712}}</ACTION>"
+- User: "system info" → Response: "Getting info. <ACTION>{"command": "system_info", "params": {}}</ACTION>"
 
-Always execute commands immediately - no clarifications."""
+Always execute commands - no exceptions, no clarifications needed."""
     
     
     def chat(self, user_message: str) -> Tuple[str, Optional[str], Optional[Dict]]:
         """Process user message and generate response"""
         try:
-            # --- MODIFICATION START ---
-            # More robust PID detection. This now runs for any message.
-            kill_keywords = ['kill', 'terminate', 'stop', 'end', 'close']
-            numbers = re.findall(r'\b(\d{2,6})\b', user_message)
-            
-            # Check if the message is PRIMARILY a number or contains a kill command with a number.
-            is_numeric_command = len(numbers) > 0 and len(user_message.split()) < 4
-            contains_kill_command = any(word in user_message.lower() for word in kill_keywords) and numbers
-
-            # If a plausible PID is found, add an explicit hint for the LLM.
-            if numbers and (is_numeric_command or contains_kill_command):
-                # Use the first number found as the most likely PID
-                user_message = f"{user_message} [PID detected: {numbers[0]}]"
-            # --- MODIFICATION END ---
-
             self.conversation_history.append({
                 "role": "user",
                 "content": user_message
@@ -475,7 +418,7 @@ Always execute commands immediately - no clarifications."""
                 model=self.model,
                 messages=[{"role": "system", "content": self.system_prompt}] + self.conversation_history,
                 temperature=0.7,
-                max_tokens=200
+                max_tokens=200  # Reduced from 500 to encourage brevity
             )
             
             assistant_message = response.choices[0].message.content
@@ -504,6 +447,7 @@ Always execute commands immediately - no clarifications."""
                     params = action_data.get('params', {})
                 except json.JSONDecodeError:
                     pass
+            
             return response_text, command, params
         
         except Exception as e:
@@ -520,7 +464,6 @@ class ShellAssistant:
         self.voice_mode = True
         self.speaking = False  # Track if currently speaking
         self.last_voice_output = ""  # Store what to speak
-        self.recent_pids = []  # Store recently shown PIDs for fuzzy matching
         
         try:
             self.assistant = ConversationalAssistant()
@@ -547,14 +490,13 @@ class ShellAssistant:
         if not text or len(text.strip()) == 0:
             return
         
-        # Always speak if TTS is available (removed length restriction)
-        if TTS_AVAILABLE:
+        if TTS_AVAILABLE and (force or len(text) > 15):
             print(f"🔊 Speaking...")
-            self.tts.speak(text, wait=wait, force=True)
-            time.sleep(0.5)  # Brief pause after speech
+            self.tts.speak(text, wait=wait, force=force)
+            time.sleep(2)  # Ensure speech completes before listening
         else:
             print(f"📝 {text}")
-            time.sleep(0.5)
+            time.sleep(1)
     
     def listen(self) -> Optional[str]:
         """Listen and get user input"""
@@ -575,9 +517,6 @@ class ShellAssistant:
                 if processes and 'error' in processes[0]:
                     return f"Error: {processes[0]['error']}"
                 
-                # Store PIDs for fuzzy matching
-                self.recent_pids = [proc['pid'] for proc in processes]
-                
                 result = f"Top {count} processes by {sort_by.upper()}:\n"
                 for i, proc in enumerate(processes, 1):
                     result += f"{i}. {proc['name']} - PID {proc['pid']}: CPU {proc['cpu']:.1f}%, Memory {proc['memory']:.1f}%\n"
@@ -586,37 +525,8 @@ class ShellAssistant:
             elif cmd_type == 'kill_process':
                 pid = params.get('pid')
                 if pid:
-                    pid_int = int(pid)
-                    
-                    # First try exact match
-                    result = self.proc_manager.kill_process(pid_int)
-                    
-                    # If not found, try fuzzy matching with recently shown PIDs
-                    if "not found" in result.lower() and self.recent_pids:
-                        pid_str = str(pid_int)
-                        matches = [p for p in self.recent_pids if str(p).startswith(pid_str)]
-                        
-                        if len(matches) == 1:
-                            # Found exactly one match!
-                            matched_pid = matches[0]
-                            result = self.proc_manager.kill_process(matched_pid)
-                            if "terminated successfully" in result.lower():
-                                result = f"✓ Matched PID {pid_int}* → {matched_pid}. " + result
-                        elif len(matches) > 1:
-                            result = f"PID {pid_int} not found. Did you mean:\n"
-                            for match in matches[:5]:
-                                result += f"  • PID {match}\n"
-                            result += "Please say the full PID number"
-                    
-                    # If still not found, show current processes
-                    if "not found" in result.lower():
-                        result += "\n\nCurrent active processes:\n"
-                        processes = self.proc_manager.get_top_processes(5, 'cpu')
-                        self.recent_pids = [proc['pid'] for proc in processes]
-                        for i, proc in enumerate(processes, 1):
-                            result += f"{i}. {proc['name']} - PID {proc['pid']}\n"
-                    return result
-                return "❌ No PID specified. Please say the process ID number to kill"
+                    return self.proc_manager.kill_process(int(pid))
+                return "Please specify a PID"
             
             elif cmd_type == 'kill_by_name':
                 name = params.get('name')
@@ -688,30 +598,21 @@ Active Processes: {info['process_count']}"""
                 user_input = self.listen()
                 
                 if not user_input:
+                    if self.voice_mode:
+                        self.speak("Sorry, didn't catch that. Try again.", force=True)
                     continue
                 
-                user_lower = user_input.lower()
+                if user_input.lower() in ['exit', 'quit']:
+                    self.speak("Goodbye!", force=True)
+                    self.running = False
+                    break
                 
-                # Check for goodbye/thanks - offer to help with something else
-                if any(word in user_lower for word in ['bye', 'goodbye', 'thanks', 'thank you', 'that\'s all', 'done', 'exit', 'quit']):
-                    self.speak("Is there anything else I can help you with?", force=True)
-                    followup = self.listen()
-                    
-                    if followup and not any(word in followup.lower() for word in ['no', 'nothing', 'bye', 'goodbye', 'nope']):
-                        # User wants more help
-                        continue
-                    else:
-                        # User is done
-                        self.speak("Goodbye! Have a great day!", force=True)
-                        self.running = False
-                        break
-                
-                elif user_lower == 'help':
+                elif user_input.lower() == 'help':
                     help_text = self.get_help()
                     print(help_text)
                     continue
                 
-                elif user_lower in ['voice', 'v']:
+                elif user_input.lower() in ['voice', 'v']:
                     self.voice_mode = not self.voice_mode
                     mode = "enabled" if self.voice_mode else "disabled"
                     print(f"Voice mode {mode}")
@@ -721,8 +622,7 @@ Active Processes: {info['process_count']}"""
                 response_text, command, params = self.assistant.chat(user_input)
                 
                 if response_text:
-                    print(f"\n🤖 Assistant: {response_text}")
-                    self.speak(response_text, wait=True, force=True)  # Speak the response!
+                    print(f"Assistant: {response_text}")
                 
                 if command:
                     print(f"🔧 Executing: {command}")
@@ -742,11 +642,10 @@ Active Processes: {info['process_count']}"""
                             print(f"⚠️ {result}")
             
             except KeyboardInterrupt:
-                print("\n\n🛑 Interrupted by user")
+                print("\n")
                 self.running = False
-                break
             except Exception as e:
-                print(f"⚠️ Error: {str(e)}")
+                print(f"Error: {str(e)}")
 
 
 def main():
