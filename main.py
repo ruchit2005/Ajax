@@ -1,6 +1,6 @@
 """
 Voice-Controlled AI Shell Assistant for Windows with OpenAI Integration
-Unlimited offline TTS using pyttsx3 - FIXED VERSION
+With Animated GUI - FIXED VERSION
 """
 
 import os
@@ -15,6 +15,9 @@ from typing import List, Dict, Tuple, Optional
 import re
 from dotenv import load_dotenv
 import time
+import tkinter as tk
+from tkinter import scrolledtext, ttk
+from PIL import Image, ImageTk, ImageSequence
 
 # Load environment variables
 load_dotenv()
@@ -69,16 +72,15 @@ class TextToSpeech:
                 except:
                     pass
                 del self.engine
-                time.sleep(0.1)  # Brief pause for cleanup
+                time.sleep(0.1)
             
             self.engine = pyttsx3.init()
             self.engine.setProperty('rate', 180)
             self.engine.setProperty('volume', 0.9)
             
-            # Set better voice if available
             voices = self.engine.getProperty('voices')
             for voice in voices:
-                if 'zira' in voice.name.lower() or 'david' in voice.name.lower():
+                if 'ravi' in voice.name.lower() or 'ravi' in voice.name.lower():
                     self.engine.setProperty('voice', voice.id)
                     break
         except Exception as e:
@@ -90,29 +92,21 @@ class TextToSpeech:
         if not text or len(text.strip()) == 0 or not self.pyttsx3_available:
             return
         
-        # Non-blocking lock check
         if not self.lock.acquire(blocking=False):
-            return  # Skip if already speaking
+            return
         
         try:
             self.is_speaking = True
-            
-            # Truncate text if too long
             text_to_speak = text[:500] if len(text) > 500 else text
-            
             print(f"🔊 Speaking: {text_to_speak[:50]}...")
-            
-            # Reinitialize engine for each call (more reliable)
             self._init_engine()
             
             if not self.engine:
                 return
             
-            # Speak
             self.engine.say(text_to_speak)
             self.engine.runAndWait()
             
-            # Cleanup
             try:
                 self.engine.stop()
             except:
@@ -120,14 +114,13 @@ class TextToSpeech:
             
         except Exception as e:
             print(f"⚠️ TTS Error: {e}")
-            # Try to recover
             self.pyttsx3_available = TTS_AVAILABLE
             if self.pyttsx3_available:
                 self._init_engine()
         finally:
             self.is_speaking = False
             self.lock.release()
-            time.sleep(0.3)  # Pause to release audio device
+            time.sleep(0.3)
     
     def stop(self):
         """Stop speaking and cleanup"""
@@ -142,7 +135,6 @@ class TextToSpeech:
 class SpeechToText:
     """
     High-accuracy STT using OpenAI Whisper API
-    Much better recognition than Google Speech API
     """
     
     def __init__(self, client=None):
@@ -152,7 +144,6 @@ class SpeechToText:
         
         if SPEECH_AVAILABLE:
             self.recognizer = sr.Recognizer()
-            # Optimized settings for clear audio capture
             self.recognizer.energy_threshold = 2000
             self.recognizer.dynamic_energy_threshold = True
             self.recognizer.pause_threshold = 0.8
@@ -172,28 +163,17 @@ class SpeechToText:
         try:
             with sr.Microphone(sample_rate=16000) as source:
                 print("🎤 Listening... (speak clearly)")
-                
-                # Quick ambient noise adjustment
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                
-                # Listen for speech
-                audio = self.recognizer.listen(
-                    source,
-                    timeout=timeout,
-                    phrase_time_limit=20
-                )
+                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=20)
             
             print("⏳ Processing with Whisper AI...")
             
-            # Try OpenAI Whisper first (much more accurate)
             if self.client:
                 try:
-                    # Save audio to temporary WAV file
                     wav_data = audio.get_wav_data()
                     with open(self.temp_audio_file, "wb") as f:
                         f.write(wav_data)
                     
-                    # Transcribe using Whisper
                     with open(self.temp_audio_file, "rb") as audio_file:
                         transcript = self.client.audio.transcriptions.create(
                             model="whisper-1",
@@ -203,13 +183,11 @@ class SpeechToText:
                     
                     result = transcript.text.strip()
                     
-                    # Cleanup temp file
                     try:
                         self.temp_audio_file.unlink()
                     except:
                         pass
                     
-                    # Show transcription with detected PIDs
                     pids = re.findall(r'\b(\d{2,6})\b', result)
                     if pids:
                         print(f"📝 Whisper: \"{result}\" [PIDs: {', '.join(pids)}]")
@@ -221,16 +199,13 @@ class SpeechToText:
                 except Exception as e:
                     print(f"⚠️ Whisper error: {e}, falling back to Google...")
             
-            # Fallback to Google Speech Recognition
             try:
                 result = self.recognizer.recognize_google(audio, language='en-US')
-                
                 pids = re.findall(r'\b(\d{2,6})\b', result)
                 if pids:
                     print(f"📝 Google: \"{result}\" [PIDs: {', '.join(pids)}]")
                 else:
                     print(f"📝 Google: \"{result}\"")
-                
                 return result
             
             except sr.UnknownValueError:
@@ -446,16 +421,13 @@ Keep responses under 15 words. Execute commands immediately."""
     def chat(self, user_message: str) -> Tuple[str, Optional[str], Optional[Dict]]:
         """Process user message"""
         try:
-            # Enhanced PID detection with explicit hints
             kill_keywords = ['kill', 'terminate', 'stop', 'end', 'close', 'quit']
             numbers = re.findall(r'\b(\d{2,6})\b', user_message)
             
-            # Add PID hint if command looks like a kill command
             has_kill_word = any(word in user_message.lower() for word in kill_keywords)
             is_just_number = len(user_message.split()) <= 2 and numbers
             
             if numbers and (has_kill_word or is_just_number):
-                # Add explicit hint for LLM
                 user_message = f"{user_message} [PID detected: {numbers[0]}]"
             
             self.conversation_history.append({
@@ -466,7 +438,7 @@ Keep responses under 15 words. Execute commands immediately."""
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": self.system_prompt}] + self.conversation_history,
-                temperature=0.5,  # Lower for more consistent parsing
+                temperature=0.5,
                 max_tokens=150
             )
             
@@ -477,11 +449,9 @@ Keep responses under 15 words. Execute commands immediately."""
                 "content": assistant_message
             })
             
-            # Keep history manageable
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-20:]
             
-            # Parse response
             command = None
             params = None
             response_text = assistant_message
@@ -505,8 +475,282 @@ Keep responses under 15 words. Execute commands immediately."""
             return f"Error: {str(e)}", None, None
 
 
+class AssistantGUI:
+    """GUI for the AI Assistant"""
+    
+    def __init__(self, assistant):
+        self.assistant = assistant
+        self.root = tk.Tk()
+        self.root.title("AI Shell Assistant")
+        self.root.geometry("900x600")
+        
+        # ===== COLOR SCHEME =====
+        # Change these values to customize the entire UI color scheme
+        # Theme: FUTURISTIC BLACK (Active)
+        self.colors = {
+            'bg_main': '#000000',        # Pure black main background
+            'bg_frame': '#0a0a0a',       # Very dark gray panels
+            'bg_text': '#000000',        # Black text area background
+            'accent': '#00ffff',         # Bright cyan accent (futuristic)
+            'success': '#00ff00',        # Bright green (Matrix-style)
+            'warning': '#ffff00',        # Bright yellow
+            'error': '#ff0000',          # Bright red
+            'text': '#00ff00',           # Green text (Matrix/terminal style)
+            'text_user': '#00ffff',      # Cyan for user input
+            'text_assistant': '#00ff00', # Green for assistant
+            'text_command': '#ffff00'    # Yellow for commands
+        }
+        
+        # UNCOMMENT ONE OF THESE PRESET THEMES:
+        
+        # Theme 2: Cyberpunk Purple
+        # self.colors = {
+        #     'bg_main': '#1a0933',
+        #     'bg_frame': '#2d1b4e',
+        #     'bg_text': '#1a0933',
+        #     'accent': '#ff00ff',
+        #     'success': '#00ff41',
+        #     'warning': '#ffff00',
+        #     'error': '#ff073a',
+        #     'text': '#e0e0e0',
+        #     'text_user': '#00ff41',
+        #     'text_assistant': '#ff00ff',
+        #     'text_command': '#ffff00'
+        # }
+        
+        # Theme 3: Matrix Green
+        # self.colors = {
+        #     'bg_main': '#0d0d0d',
+        #     'bg_frame': '#1a1a1a',
+        #     'bg_text': '#000000',
+        #     'accent': '#00ff00',
+        #     'success': '#00ff00',
+        #     'warning': '#ffff00',
+        #     'error': '#ff0000',
+        #     'text': '#00ff00',
+        #     'text_user': '#00ff00',
+        #     'text_assistant': '#33ff33',
+        #     'text_command': '#66ff66'
+        # }
+        
+        # Theme 4: Ocean Blue
+        # self.colors = {
+        #     'bg_main': '#001f3f',
+        #     'bg_frame': '#003d5c',
+        #     'bg_text': '#001529',
+        #     'accent': '#39cccc',
+        #     'success': '#2ecc40',
+        #     'warning': '#ffdc00',
+        #     'error': '#ff4136',
+        #     'text': '#dddddd',
+        #     'text_user': '#7fdbff',
+        #     'text_assistant': '#39cccc',
+        #     'text_command': '#ffdc00'
+        # }
+        
+        # Theme 5: Sunset Orange
+        # self.colors = {
+        #     'bg_main': '#2d1b1b',
+        #     'bg_frame': '#4a2f2f',
+        #     'bg_text': '#1a0f0f',
+        #     'accent': '#ff6b35',
+        #     'success': '#00d9a3',
+        #     'warning': '#ffc857',
+        #     'error': '#e63946',
+        #     'text': '#f5f5f5',
+        #     'text_user': '#00d9a3',
+        #     'text_assistant': '#ff6b35',
+        #     'text_command': '#ffc857'
+        # }
+        
+        # Theme 6: Midnight Purple
+        # self.colors = {
+        #     'bg_main': '#1b1b2f',
+        #     'bg_frame': '#2d2d44',
+        #     'bg_text': '#16162a',
+        #     'accent': '#bb86fc',
+        #     'success': '#03dac6',
+        #     'warning': '#ffb300',
+        #     'error': '#cf6679',
+        #     'text': '#e0e0e0',
+        #     'text_user': '#03dac6',
+        #     'text_assistant': '#bb86fc',
+        #     'text_command': '#ffb300'
+        # }
+        
+        self.root.configure(bg=self.colors['bg_main'])
+        
+        # Animation variables
+        self.gif_frames = []
+        self.current_frame = 0
+        self.animation_running = True
+        
+        # Thread-safe queues for GUI updates
+        self.output_queue = queue.Queue()
+        self.status_queue = queue.Queue()
+        
+        self.setup_ui()
+        self.load_animation()
+        self.process_queues()  # Start processing queue updates
+        
+    def setup_ui(self):
+        """Create the UI layout"""
+        # Main container
+        main_frame = tk.Frame(self.root, bg=self.colors['bg_main'])
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Left side - Animation (with cyan border for futuristic look)
+        left_frame = tk.Frame(main_frame, bg=self.colors['bg_frame'], 
+                             relief=tk.SOLID, borderwidth=2, 
+                             highlightbackground=self.colors['accent'], 
+                             highlightthickness=2)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        # Title
+        title_label = tk.Label(left_frame, text="🤖 AI ASSISTANT", 
+                               font=('Consolas', 16, 'bold'), 
+                               bg=self.colors['bg_frame'], fg=self.colors['accent'])
+        title_label.pack(pady=10)
+        
+        # Animation label
+        self.animation_label = tk.Label(left_frame, bg=self.colors['bg_frame'])
+        self.animation_label.pack(expand=True, pady=20)
+        
+        # Status label
+        self.status_label = tk.Label(left_frame, text="● READY", 
+                                     font=('Consolas', 12, 'bold'), 
+                                     bg=self.colors['bg_frame'], fg=self.colors['success'])
+        self.status_label.pack(pady=10)
+        
+        # Right side - Output (with cyan border)
+        right_frame = tk.Frame(main_frame, bg=self.colors['bg_frame'], 
+                              relief=tk.SOLID, borderwidth=2,
+                              highlightbackground=self.colors['accent'], 
+                              highlightthickness=2)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        # Output title
+        output_title = tk.Label(right_frame, text="📋 SYSTEM OUTPUT", 
+                               font=('Consolas', 14, 'bold'), 
+                               bg=self.colors['bg_frame'], fg=self.colors['accent'])
+        output_title.pack(pady=10)
+        
+        # Output text area
+        self.output_text = scrolledtext.ScrolledText(
+            right_frame,
+            wrap=tk.WORD,
+            font=('Consolas', 10),
+            bg=self.colors['bg_text'],
+            fg=self.colors['text'],
+            insertbackground=self.colors['accent'],
+            relief=tk.FLAT,
+            padx=10,
+            pady=10,
+            selectbackground=self.colors['accent'],
+            selectforeground='#000000'
+        )
+        self.output_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        
+        # Configure tags for colored output
+        self.output_text.tag_config('user', foreground=self.colors['text_user'], font=('Consolas', 10, 'bold'))
+        self.output_text.tag_config('assistant', foreground=self.colors['text_assistant'], font=('Consolas', 10, 'bold'))
+        self.output_text.tag_config('command', foreground=self.colors['text_command'], font=('Consolas', 10, 'italic'))
+        self.output_text.tag_config('result', foreground=self.colors['text'])
+        self.output_text.tag_config('error', foreground=self.colors['error'])
+        
+        # Initial message
+        self.append_output(">>> AI SHELL ASSISTANT INITIALIZED <<<\n", 'assistant')
+        self.append_output("SYSTEM READY FOR VOICE COMMANDS\n\n", 'result')
+        
+    def load_animation(self):
+        """Load the GIF animation"""
+        try:
+            # Try to load sparkle-erio.gif from current directory
+            gif_path = "sparkle-erio.gif"
+            if not os.path.exists(gif_path):
+                # If not found, create a placeholder
+                self.create_placeholder()
+                return
+            
+            gif = Image.open(gif_path)
+            
+            # Extract all frames
+            for frame in ImageSequence.Iterator(gif):
+                frame = frame.convert('RGBA')
+                frame = frame.resize((300, 300), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(frame)
+                self.gif_frames.append(photo)
+            
+            # Start animation
+            self.animate()
+            
+        except Exception as e:
+            print(f"⚠️ Could not load GIF: {e}")
+            self.create_placeholder()
+    
+    def create_placeholder(self):
+        """Create a placeholder if GIF is not found"""
+        placeholder = tk.Label(
+            self.animation_label.master,
+            text="🌟\n\nPlace sparkle-erio.gif\nin the same folder\nas this script",
+            font=('Arial', 14),
+            bg=self.colors['bg_frame'],
+            fg=self.colors['accent'],
+            justify=tk.CENTER
+        )
+        self.animation_label.pack_forget()
+        placeholder.pack(expand=True, pady=20)
+    
+    def animate(self):
+        """Animate the GIF"""
+        if self.animation_running and self.gif_frames:
+            self.animation_label.configure(image=self.gif_frames[self.current_frame])
+            self.current_frame = (self.current_frame + 1) % len(self.gif_frames)
+            self.root.after(50, self.animate)  # ~20 FPS
+    
+    def append_output(self, text, tag='result'):
+        """Thread-safe append text to output area"""
+        self.output_queue.put((text, tag))
+    
+    def update_status(self, status, color='#00ff88'):
+        """Thread-safe update status label"""
+        self.status_queue.put((status, color))
+    
+    def process_queues(self):
+        """Process queued GUI updates from worker threads"""
+        # Process output queue
+        try:
+            while not self.output_queue.empty():
+                text, tag = self.output_queue.get_nowait()
+                self.output_text.insert(tk.END, text, tag)
+                self.output_text.see(tk.END)
+        except queue.Empty:
+            pass
+        
+        # Process status queue
+        try:
+            while not self.status_queue.empty():
+                status, color = self.status_queue.get_nowait()
+                self.status_label.config(text=f"● {status}", fg=color)
+        except queue.Empty:
+            pass
+        
+        # Schedule next queue processing
+        if self.animation_running:
+            self.root.after(100, self.process_queues)  # Check every 100ms
+    
+    def run(self):
+        """Start the GUI"""
+        self.root.mainloop()
+    
+    def destroy(self):
+        """Clean up and close"""
+        self.animation_running = False
+        self.root.destroy()
+
+
 class ShellAssistant:
-    """Main AI Shell Assistant"""
+    """Main AI Shell Assistant with GUI"""
     
     def __init__(self):
         self.proc_manager = ProcessManager()
@@ -514,6 +758,7 @@ class ShellAssistant:
         self.running = True
         self.voice_mode = True
         self.recent_pids = []
+        self.gui = None
         
         try:
             self.assistant = ConversationalAssistant()
@@ -574,7 +819,6 @@ class ShellAssistant:
                 pid_int = int(pid)
                 result = self.proc_manager.kill_process(pid_int)
                 
-                # Try fuzzy matching if not found
                 if "not found" in result.lower() and self.recent_pids:
                     pid_str = str(pid_int)
                     matches = [p for p in self.recent_pids if str(p).startswith(pid_str)]
@@ -633,11 +877,7 @@ Threads: {info['num_threads']}"""
     
     def get_help(self) -> str:
         """Display help"""
-        return """╔════════════════════════════════════════╗
-║        AI SHELL ASSISTANT HELP         ║
-╚════════════════════════════════════════╝
-
-Voice Commands:
+        return """Voice Commands:
   • "show top processes"
   • "kill process [PID]" or just say the PID
   • "kill [process name]"
@@ -656,86 +896,126 @@ Tips:
 """
     
     def run_interactive(self):
-        """Main loop with improved flow"""
-        print("=" * 60)
-        print("    AI SHELL ASSISTANT - High Accuracy Voice")
-        print("=" * 60)
-        print("\n✓ OpenAI Whisper STT (95%+ accuracy)")
-        print("✓ Unlimited offline speech (pyttsx3)")
-        print("✓ No API rate limits")
-        print("✓ Intelligent PID matching")
-        print("✓ Natural conversation")
-        print("\nType 'help' for commands\n")
+        """Main loop with GUI"""
+        # Initialize GUI
+        self.gui = AssistantGUI(self)
+        
+        # Show welcome message
+        self.gui.append_output("=" * 50 + "\n", 'result')
+        self.gui.append_output("🎙️ AI SHELL ASSISTANT - Voice Enabled\n", 'assistant')
+        self.gui.append_output("=" * 50 + "\n\n", 'result')
+        self.gui.append_output("✓ OpenAI Whisper STT (95%+ accuracy)\n", 'result')
+        self.gui.append_output("✓ Unlimited offline speech (pyttsx3)\n", 'result')
+        self.gui.append_output("✓ No API rate limits\n", 'result')
+        self.gui.append_output("✓ Intelligent PID matching\n\n", 'result')
+        
+        # Start listening in separate thread
+        listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        listen_thread.start()
         
         self.speak("AI Shell Assistant ready.", force=True)
         
+        # Run GUI main loop
+        self.gui.run()
+    
+    def _listen_loop(self):
+        """Continuous listening loop"""
         while self.running:
             try:
+                self.gui.update_status("🎤 Listening...", '#00d9ff')
                 user_input = self.listen()
                 
                 if not user_input:
                     continue
                 
+                # Display transcription
+                self.gui.append_output(f"\n👤 YOU: ", 'user')
+                self.gui.append_output(f"{user_input}\n", 'result')
+                
                 user_lower = user_input.lower()
                 
                 # Handle exit/goodbye
                 if any(word in user_lower for word in ['exit', 'quit', 'bye', 'goodbye']):
+                    self.gui.append_output("\n🤖 ASSISTANT: ", 'assistant')
+                    self.gui.append_output("Goodbye!\n", 'result')
                     self.speak("Goodbye!", force=True)
                     self.running = False
+                    time.sleep(1)
+                    self.gui.destroy()
                     break
                 
-                # Handle special commands
+                # Handle help
                 if user_lower == 'help':
-                    print(self.get_help())
+                    help_text = self.get_help()
+                    self.gui.append_output(f"\n{help_text}\n", 'result')
                     continue
                 
+                # Handle voice toggle
                 if user_lower in ['voice', 'v']:
                     self.voice_mode = not self.voice_mode
                     mode = "enabled" if self.voice_mode else "disabled"
                     msg = f"Voice mode {mode}"
-                    print(msg)
+                    self.gui.append_output(f"\n🤖 ASSISTANT: ", 'assistant')
+                    self.gui.append_output(f"{msg}\n", 'result')
                     self.speak(msg, force=True)
                     continue
                 
                 # Process with LLM
-                print("\n⏳ Processing...")
+                self.gui.update_status("⏳ Processing...", '#ffd700')
                 response_text, command, params = self.assistant.chat(user_input)
                 
-                # Speak and show response
+                # Display assistant response
                 if response_text:
-                    print(f"\n🤖 {response_text}")
+                    self.gui.append_output(f"\n🤖 ASSISTANT: ", 'assistant')
+                    self.gui.append_output(f"{response_text}\n", 'result')
                     self.speak(response_text, wait=True, force=True)
                 
                 # Execute command
                 if command:
-                    print(f"🔧 Executing: {command}")
+                    self.gui.append_output(f"\n⚙️  EXECUTING: ", 'command')
+                    self.gui.append_output(f"{command}\n", 'command')
+                    self.gui.update_status("⚙️ Executing...", '#ff6b6b')
+                    
                     result = self.execute_command(command, params)
-                    print(f"\n{result}\n")
+                    
+                    self.gui.append_output(f"\n📊 RESULT:\n", 'command')
+                    
+                    # Color-code results
+                    if "✓" in result:
+                        self.gui.append_output(f"{result}\n", 'result')
+                    elif "❌" in result:
+                        self.gui.append_output(f"{result}\n", 'error')
+                    else:
+                        self.gui.append_output(f"{result}\n", 'result')
                     
                     # Speak brief result for certain commands
                     if command in ['kill_process', 'kill_by_name']:
                         if "✓" in result and len(result) < 80:
                             self.speak(result.split('\n')[0], wait=True, force=True)
+                
+                self.gui.update_status("✓ Ready", '#00ff88')
             
-            except KeyboardInterrupt:
-                print("\n\n🛑 Interrupted")
-                self.running = False
-                break
             except Exception as e:
-                print(f"⚠️ Error: {str(e)}")
+                error_msg = f"⚠️ Error: {str(e)}"
+                self.gui.append_output(f"\n{error_msg}\n", 'error')
+                print(error_msg)
                 import traceback
                 traceback.print_exc()
+                self.gui.update_status("⚠️ Error", '#ff6b6b')
+                time.sleep(2)
+                self.gui.update_status("✓ Ready", '#00ff88')
 
 
 def main():
     """Entry point"""
     print("\n" + "=" * 60)
-    print("  AI SHELL ASSISTANT - OpenAI Whisper STT")
+    print("  AI SHELL ASSISTANT - GUI with Whisper STT")
     print("=" * 60)
     print("\nRequired packages:")
     print("  pip install psutil SpeechRecognition pyaudio")
-    print("  pip install python-dotenv openai pyttsx3")
+    print("  pip install python-dotenv openai pyttsx3 pillow")
     print("\nFeatures:")
+    print("  • Animated GUI with real-time transcription")
     print("  • OpenAI Whisper for 95%+ accurate voice recognition")
     print("  • Unlimited offline TTS (pyttsx3)")
     print("  • GPT-3.5 for natural language processing")
