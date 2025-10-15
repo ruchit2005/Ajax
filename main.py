@@ -291,6 +291,137 @@ class ProcessManager:
             return f"❌ Error: {str(e)}"
     
     @staticmethod
+    def open_application(app_name: str) -> str:
+        """Open an application and return parent/child PID info"""
+        # Common application mappings
+        app_paths = {
+            'camera': 'microsoft.windows.camera:',
+            'notepad': 'notepad.exe',
+            'calculator': 'calc.exe',
+            'paint': 'mspaint.exe',
+            'chrome': r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            'brave': r'C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe',
+            'firefox': r'C:\Program Files\Mozilla Firefox\firefox.exe',
+            'edge': r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            'spotify': os.path.join(os.getenv('APPDATA', ''), r'Spotify\Spotify.exe'),
+            'discord': os.path.join(os.getenv('LOCALAPPDATA', ''), r'Discord\app-1.0.9003\Discord.exe'),
+            'vscode': r'C:\Users\{}\AppData\Local\Programs\Microsoft VS Code\Code.exe'.format(os.getenv('USERNAME')),
+            'code': r'C:\Users\{}\AppData\Local\Programs\Microsoft VS Code\Code.exe'.format(os.getenv('USERNAME')),
+            'word': r'C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE',
+            'excel': r'C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE',
+            'powerpoint': r'C:\Program Files\Microsoft Office\root\Office16\POWERPNT.EXE',
+            'teams': os.path.join(os.getenv('LOCALAPPDATA', ''), r'Microsoft\Teams\current\Teams.exe'),
+            'outlook': r'C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE',
+        }
+        
+        app_name_lower = app_name.lower()
+        
+        try:
+            # Get current process count before opening
+            initial_pids = set(psutil.pids())
+            
+            # Try to find the app path
+            app_path = None
+            for key, path in app_paths.items():
+                if key in app_name_lower:
+                    app_path = path
+                    break
+            
+            # If not found in mappings, try to use it as-is
+            if not app_path:
+                app_path = app_name
+            
+            # Open the application
+            if app_path.startswith('microsoft.windows.'):
+                # Windows Store apps
+                process = subprocess.Popen(['explorer.exe', app_path], 
+                                          shell=True,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE)
+                parent_pid = process.pid
+            else:
+                # Regular desktop applications
+                if os.path.exists(app_path):
+                    process = subprocess.Popen([app_path],
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE)
+                    parent_pid = process.pid
+                else:
+                    # Try using start command for apps in PATH
+                    process = subprocess.Popen(['start', '', app_path],
+                                              shell=True,
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE)
+                    parent_pid = process.pid
+            
+            # Wait a moment for the app to start
+            time.sleep(2)
+            
+            # Get new PIDs after opening
+            new_pids = set(psutil.pids()) - initial_pids
+            
+            # Find the actual parent process
+            actual_parent_pid = None
+            child_pids = []
+            
+            # Try to find the main process by name
+            for pid in new_pids:
+                try:
+                    proc = psutil.Process(pid)
+                    proc_name = proc.name().lower()
+                    
+                    # Check if this is the main application process
+                    if any(key in proc_name for key in app_paths.keys() if key in app_name_lower):
+                        actual_parent_pid = pid
+                        
+                        # Get children of this process
+                        children = proc.children(recursive=True)
+                        child_pids = [child.pid for child in children]
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # If we found the process
+            if actual_parent_pid:
+                parent_proc = psutil.Process(actual_parent_pid)
+                result = f"✓ Opened {app_name}\n"
+                result += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                result += f"📌 PARENT PROCESS:\n"
+                result += f"   • Name: {parent_proc.name()}\n"
+                result += f"   • PID: {actual_parent_pid}\n"
+                result += f"   • Status: {parent_proc.status()}\n"
+                result += f"   • CPU: {parent_proc.cpu_percent()}%\n"
+                result += f"   • Memory: {parent_proc.memory_info().rss / 1024 / 1024:.1f} MB\n"
+                
+                if child_pids:
+                    result += f"\n👶 CHILD PROCESSES ({len(child_pids)}):\n"
+                    for idx, child_pid in enumerate(child_pids[:5], 1):  # Show first 5
+                        try:
+                            child_proc = psutil.Process(child_pid)
+                            result += f"   {idx}. {child_proc.name()} - PID {child_pid}\n"
+                        except:
+                            result += f"   {idx}. PID {child_pid} (terminated)\n"
+                    
+                    if len(child_pids) > 5:
+                        result += f"   ... and {len(child_pids) - 5} more child processes\n"
+                else:
+                    result += f"\n👶 CHILD PROCESSES: None\n"
+                
+                result += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                return result
+            else:
+                # Fallback: just show that we tried to open it
+                result = f"✓ Attempted to open {app_name}\n"
+                result += f"Process started but detailed info not available.\n"
+                result += f"The application may be starting in the background."
+                return result
+        
+        except FileNotFoundError:
+            return f"❌ Application '{app_name}' not found.\nPlease check if it's installed or provide the full path."
+        except Exception as e:
+            return f"❌ Error opening '{app_name}': {str(e)}"
+    
+    @staticmethod
     def get_system_info() -> Dict:
         """Get system resource information"""
         try:
@@ -402,11 +533,23 @@ Available commands:
 6. list_files - List directory contents
    params: path (string)
 
+7. open_app - Open an application
+   params: app_name (string)
+   Examples: "open chrome", "open spotify", "open calculator", "open camera"
+
 CRITICAL PID EXTRACTION RULES:
 - Extract ALL digits from commands like: "kill 1234", "terminate 5678", "stop 9012"
 - Look for [PID detected: NUMBER] hints in user messages
 - If you see a number after "kill/terminate/stop", use that exact PID
 - NEVER use fake PIDs - only real numbers from user input
+
+OPEN APP RULES:
+- When user says "open X" or "launch X" or "start X", use open_app command
+- Extract the app name after "open/launch/start"
+- Examples: 
+  * "open chrome" → <ACTION>{"command": "open_app", "params": {"app_name": "chrome"}}</ACTION>
+  * "launch spotify" → <ACTION>{"command": "open_app", "params": {"app_name": "spotify"}}</ACTION>
+  * "start calculator" → <ACTION>{"command": "open_app", "params": {"app_name": "calculator"}}</ACTION>
 - If unclear, show top_processes first
 
 Response format: "Short response. <ACTION>{"command": "...", "params": {...}}</ACTION>"
@@ -869,6 +1012,12 @@ Threads: {info['num_threads']}"""
                 path = params.get('path', '.')
                 return self.proc_manager.list_files(path)
             
+            elif cmd_type == 'open_app':
+                app_name = params.get('app_name')
+                if not app_name:
+                    return "❌ No application name specified"
+                return self.proc_manager.open_application(app_name)
+            
             else:
                 return f"❌ Unknown command: {cmd_type}"
         
@@ -881,8 +1030,16 @@ Threads: {info['num_threads']}"""
   • "show top processes"
   • "kill process [PID]" or just say the PID
   • "kill [process name]"
+  • "open [app name]" - Launch applications
   • "system info"
   • "list files in [path]"
+
+Supported Apps to Open:
+  • Browsers: chrome, brave, firefox, edge
+  • Apps: spotify, discord, camera, calculator
+  • Office: word, excel, powerpoint, outlook
+  • Dev: vscode, code, teams
+  • Basic: notepad, paint
 
 Keyboard:
   • 'help' - Show this help
@@ -893,6 +1050,7 @@ Tips:
   • Speak clearly and wait for response
   • Say PIDs slowly for accuracy
   • Use admin rights for protected processes
+  • Opening apps will show parent PID and child PIDs
 """
     
     def run_interactive(self):
