@@ -6,6 +6,11 @@ A powerful voice-controlled AI assistant for Windows that combines natural langu
 ![Python](https://img.shields.io/badge/python-3.11%2B-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+<div align="center">
+  <img src="sparkle-erio.gif" alt="AI Assistant Animation" width="300"/>
+  <p><em>AI Shell Assistant in action with futuristic GUI</em></p>
+</div>
+
 ## ✨ Features
 
 ### 🎙️ Voice Control
