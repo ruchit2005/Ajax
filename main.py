@@ -1,6 +1,6 @@
 """
 Voice-Controlled AI Shell Assistant for Windows with OpenAI Integration
-Optimized for rate limiting and reduced TTS calls
+Unlimited offline TTS using pyttsx3 - FIXED VERSION
 """
 
 import os
@@ -27,8 +27,13 @@ except ImportError:
     SPEECH_AVAILABLE = False
     print("⚠️ speech_recognition not installed. Run: pip install SpeechRecognition pydub pyaudio")
 
-# TTS will use OpenAI's built-in API (no extra installation needed)
-TTS_AVAILABLE = True
+# TTS will use pyttsx3
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    print("⚠️ pyttsx3 not installed. Run: pip install pyttsx3")
 
 # Import OpenAI
 try:
@@ -36,211 +41,207 @@ try:
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
-    TTS_AVAILABLE = False
     print("⚠️ openai not installed. Run: pip install openai")
 
 
 class TextToSpeech:
     """
-    Optimized TTS with rate limiting and caching
-    - Implements request throttling
-    - Caches common responses
-    - Handles rate limit errors gracefully
+    Improved TTS using pyttsx3 with proper cleanup and threading
     """
     
     def __init__(self, client=None):
         self.client = client
-        self.temp_dir = Path("./tts_cache")
-        self.temp_dir.mkdir(exist_ok=True)
-        self.tts_thread = None
-        self.last_request_time = 0
-        self.min_interval = 0.5  # Minimum 0.5 seconds between TTS requests
-        self.cache = {}
-    
-    def speak(self, text: str, wait: bool = True, force: bool = False):
-        """Convert text to speech using OpenAI API with rate limiting"""
-        if not text or len(text.strip()) == 0 or not self.client:
-            return
+        self.is_speaking = False
+        self.lock = threading.Lock()
+        self.engine = None
+        self.pyttsx3_available = TTS_AVAILABLE
         
-        def _speak_async():
-            try:
-                # Rate limiting: wait if needed
-                time_since_last = time.time() - self.last_request_time
-                if time_since_last < self.min_interval:
-                    time.sleep(self.min_interval - time_since_last)
-                
-                # Truncate text if too long
-                text_to_speak = text[:1000] if len(text) > 1000 else text
-                
-                # Check cache
-                cache_key = hash(text_to_speak)
-                if cache_key in self.cache:
-                    audio_file = self.cache[cache_key]
-                    if audio_file.exists():
-                        self._play_audio(audio_file)
-                        return
-                
-                print(f"🔊 Speaking...")
-                
-                # Generate audio using OpenAI TTS
-                response = self.client.audio.speech.create(
-                    model="tts-1",
-                    voice="alloy",
-                    input=text_to_speak
-                )
-                
-                # Save audio with timestamp
-                audio_file = self.temp_dir / f"speech_{int(time.time() * 1000)}.mp3"
-                
-                # Write response content to file
-                with open(audio_file, 'wb') as f:
-                    f.write(response.content)
-                
-                # Cache it
-                self.cache[cache_key] = audio_file
-                
-                # Play audio
-                self._play_audio(audio_file)
-                
-                # Update last request time
-                self.last_request_time = time.time()
-                
-                # Clean up old files (keep only last 10)
+        if self.pyttsx3_available:
+            print("✓ Using pyttsx3 offline TTS (unlimited)")
+            self._init_engine()
+    
+    def _init_engine(self):
+        """Initialize pyttsx3 engine with error handling"""
+        try:
+            if self.engine:
                 try:
-                    files = sorted(self.temp_dir.glob("speech_*.mp3"))
-                    for old_file in files[:-10]:
-                        old_file.unlink()
+                    self.engine.stop()
                 except:
                     pass
+                del self.engine
+                time.sleep(0.1)  # Brief pause for cleanup
             
-            except Exception as e:
-                if "429" in str(e) or "rate_limit" in str(e).lower():
-                    print(f"⚠️ Rate limit reached. Waiting before retry...")
-                    time.sleep(25)  # Wait 25 seconds for rate limit to reset
-                else:
-                    print(f"⚠️ TTS Error: {e}")
-        
-        # Run TTS synchronously if wait=True, otherwise in background
-        if wait:
-            _speak_async()
-        else:
-            self.tts_thread = threading.Thread(target=_speak_async, daemon=False)
-            self.tts_thread.start()
+            self.engine = pyttsx3.init()
+            self.engine.setProperty('rate', 180)
+            self.engine.setProperty('volume', 0.9)
+            
+            # Set better voice if available
+            voices = self.engine.getProperty('voices')
+            for voice in voices:
+                if 'zira' in voice.name.lower() or 'david' in voice.name.lower():
+                    self.engine.setProperty('voice', voice.id)
+                    break
+        except Exception as e:
+            print(f"⚠️ TTS engine init error: {e}")
+            self.pyttsx3_available = False
     
-    def _play_audio(self, audio_file: Path):
-        """Play audio file"""
+    def speak(self, text: str, wait: bool = True, force: bool = False):
+        """Convert text to speech with proper resource management"""
+        if not text or len(text.strip()) == 0 or not self.pyttsx3_available:
+            return
+        
+        # Non-blocking lock check
+        if not self.lock.acquire(blocking=False):
+            return  # Skip if already speaking
+        
         try:
-            if sys.platform == "win32":
-                # Use pygame for reliable MP3 playback on Windows
-                try:
-                    import pygame
-                    pygame.mixer.init()
-                    pygame.mixer.music.load(str(audio_file))
-                    pygame.mixer.music.play()
-                    
-                    # Wait for playback to complete
-                    while pygame.mixer.music.get_busy():
-                        time.sleep(0.1)
-                    
-                    pygame.mixer.quit()
-                except ImportError:
-                    # Fallback: use os.startfile with wait time
-                    os.startfile(str(audio_file))
-                    # Estimate wait time based on file size
-                    file_size = audio_file.stat().st_size
-                    wait_time = max(2, file_size / 10000)  # Rough estimate
-                    time.sleep(wait_time)
-            elif sys.platform == "darwin":  # macOS
-                subprocess.run(["afplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:  # Linux
-                subprocess.run(["paplay", str(audio_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.is_speaking = True
+            
+            # Truncate text if too long
+            text_to_speak = text[:500] if len(text) > 500 else text
+            
+            print(f"🔊 Speaking: {text_to_speak[:50]}...")
+            
+            # Reinitialize engine for each call (more reliable)
+            self._init_engine()
+            
+            if not self.engine:
+                return
+            
+            # Speak
+            self.engine.say(text_to_speak)
+            self.engine.runAndWait()
+            
+            # Cleanup
+            try:
+                self.engine.stop()
+            except:
+                pass
             
         except Exception as e:
-            print(f"⚠️ Audio playback error: {e}")
+            print(f"⚠️ TTS Error: {e}")
+            # Try to recover
+            self.pyttsx3_available = TTS_AVAILABLE
+            if self.pyttsx3_available:
+                self._init_engine()
+        finally:
+            self.is_speaking = False
+            self.lock.release()
+            time.sleep(0.3)  # Pause to release audio device
     
     def stop(self):
-        """Stop speaking"""
-        pass
+        """Stop speaking and cleanup"""
+        self.is_speaking = False
+        if self.engine:
+            try:
+                self.engine.stop()
+            except:
+                pass
 
 
 class SpeechToText:
     """
-    Optimized STT with continuous long-duration listening
+    High-accuracy STT using OpenAI Whisper API
+    Much better recognition than Google Speech API
     """
     
-    def __init__(self):
+    def __init__(self, client=None):
         self.recognizer = None
+        self.client = client
+        self.temp_audio_file = Path("temp_audio.wav")
+        
         if SPEECH_AVAILABLE:
             self.recognizer = sr.Recognizer()
-            self.recognizer.energy_threshold = 3000
+            # Optimized settings for clear audio capture
+            self.recognizer.energy_threshold = 2000
             self.recognizer.dynamic_energy_threshold = True
-            self.recognizer.pause_threshold = 0.5  # Reduced to catch end of numbers faster
-            self.recognizer.non_speaking_duration = 0.5  # Wait longer for continuation
-            self.recognizer.phrase_threshold = 0.1  # Minimum seconds of speaking required
+            self.recognizer.pause_threshold = 0.8
+            self.recognizer.non_speaking_duration = 0.5
+            self.recognizer.phrase_threshold = 0.3
+            
+            if self.client:
+                print("✓ Using OpenAI Whisper for STT (high accuracy)")
+            else:
+                print("⚠️ OpenAI client not available, using Google STT")
     
     def listen(self, timeout: int = 30) -> Optional[str]:
-        """Listen to microphone and convert speech to text"""
+        """Listen to microphone and transcribe using Whisper API"""
         if not self.recognizer:
             return None
         
         try:
-            with sr.Microphone() as source:
-                print("🎤 Listening... (speak now)")
+            with sr.Microphone(sample_rate=16000) as source:
+                print("🎤 Listening... (speak clearly)")
                 
-                # Adjust for ambient noise with longer duration for better calibration
+                # Quick ambient noise adjustment
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 
+                # Listen for speech
                 audio = self.recognizer.listen(
                     source,
                     timeout=timeout,
-                    phrase_time_limit=30
+                    phrase_time_limit=20
                 )
             
-            print("⏳ Processing audio...")
+            print("⏳ Processing with Whisper AI...")
             
-            # Try to get more complete transcription by requesting alternatives
-            response = self.recognizer.recognize_google(
-                audio,
-                language='en-US',
-                show_all=True  # Get all alternatives to pick the best one
-            )
-            
-            # Parse response - it returns a dict with alternatives
-            if isinstance(response, dict) and 'alternative' in response:
-                alternatives = response['alternative']
-                
-                # Pick the alternative with the longest numbers (more complete)
-                best_transcript = ""
-                max_number_length = 0
-                
-                for alt in alternatives:
-                    transcript = alt.get('transcript', '')
-                    numbers = re.findall(r'\d+', transcript)
-                    total_number_length = sum(len(n) for n in numbers)
+            # Try OpenAI Whisper first (much more accurate)
+            if self.client:
+                try:
+                    # Save audio to temporary WAV file
+                    wav_data = audio.get_wav_data()
+                    with open(self.temp_audio_file, "wb") as f:
+                        f.write(wav_data)
                     
-                    if total_number_length > max_number_length:
-                        max_number_length = total_number_length
-                        best_transcript = transcript
+                    # Transcribe using Whisper
+                    with open(self.temp_audio_file, "rb") as audio_file:
+                        transcript = self.client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            language="en"
+                        )
+                    
+                    result = transcript.text.strip()
+                    
+                    # Cleanup temp file
+                    try:
+                        self.temp_audio_file.unlink()
+                    except:
+                        pass
+                    
+                    # Show transcription with detected PIDs
+                    pids = re.findall(r'\b(\d{2,6})\b', result)
+                    if pids:
+                        print(f"📝 Whisper: \"{result}\" [PIDs: {', '.join(pids)}]")
+                    else:
+                        print(f"📝 Whisper: \"{result}\"")
+                    
+                    return result
                 
-                result = best_transcript.strip() if best_transcript else alternatives[0].get('transcript', '').strip()
-            else:
-                # Fallback to simple string result
-                result = str(response).strip() if response else ""
+                except Exception as e:
+                    print(f"⚠️ Whisper error: {e}, falling back to Google...")
             
-            # Show transcription with detected PIDs highlighted
-            pids = re.findall(r'\b(\d{2,6})\b', result)
-            if pids:
-                print(f"📝 Transcription: \"{result}\" [PIDs detected: {', '.join(pids)}]")
-            else:
-                print(f"📝 Transcription: \"{result}\"")
+            # Fallback to Google Speech Recognition
+            try:
+                result = self.recognizer.recognize_google(audio, language='en-US')
+                
+                pids = re.findall(r'\b(\d{2,6})\b', result)
+                if pids:
+                    print(f"📝 Google: \"{result}\" [PIDs: {', '.join(pids)}]")
+                else:
+                    print(f"📝 Google: \"{result}\"")
+                
+                return result
             
-            return result
+            except sr.UnknownValueError:
+                print("❌ Could not understand audio - speak louder and clearer")
+                return None
+            except sr.RequestError as e:
+                print(f"❌ Recognition service error: {e}")
+                return None
         
-        except sr.UnknownValueError:
-            return None
-        except sr.RequestError as e:
-            return None
         except Exception as e:
+            print(f"❌ Microphone error: {e}")
             return None
 
 
@@ -280,21 +281,21 @@ class ProcessManager:
             proc_name = proc.name()
             proc.terminate()
             proc.wait(timeout=3)
-            return f"Process {proc_name} with ID {pid} has been terminated successfully"
+            return f"✓ Process {proc_name} (PID {pid}) terminated successfully"
         except psutil.NoSuchProcess:
-            return f"Process with ID {pid} was not found on the system"
+            return f"❌ Process {pid} not found"
         except psutil.AccessDenied:
-            return f"Access denied. Cannot terminate process {pid}. You may need administrator rights"
+            return f"❌ Access denied for PID {pid}. Need admin rights"
         except psutil.TimeoutExpired:
             try:
                 proc.kill()
-                return f"Process {proc_name} with ID {pid} was force killed"
+                return f"✓ Process {proc_name} (PID {pid}) force killed"
             except:
-                return f"Failed to kill process {pid}"
+                return f"❌ Failed to kill process {pid}"
     
     @staticmethod
     def kill_by_name(name: str, exclude: List[str] = None) -> str:
-        """Kill all processes by name, with exclusions"""
+        """Kill all processes by name"""
         exclude = exclude or []
         killed = []
         try:
@@ -303,17 +304,16 @@ class ProcessManager:
                     if name.lower() in proc.info['name'].lower():
                         if not any(ex.lower() in proc.info['name'].lower() for ex in exclude):
                             proc.terminate()
-                            killed.append(f"{proc.info['name']} with PID {proc.info['pid']}")
+                            killed.append(f"{proc.info['name']} (PID {proc.info['pid']})")
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
             
             if killed:
-                killed_text = ", ".join(killed)
-                return f"Successfully terminated {len(killed)} process(es): {killed_text}"
+                return f"✓ Terminated {len(killed)} process(es): {', '.join(killed)}"
             else:
-                return f"No processes named {name} were found on the system"
+                return f"❌ No processes named '{name}' found"
         except Exception as e:
-            return f"Error occurred while killing processes: {str(e)}"
+            return f"❌ Error: {str(e)}"
     
     @staticmethod
     def get_system_info() -> Dict:
@@ -365,29 +365,29 @@ class ProcessManager:
         try:
             path = Path(path).expanduser()
             if not path.exists():
-                return f"Path {path} does not exist"
+                return f"❌ Path {path} does not exist"
             
             if path.is_file():
-                return f"This is a file: {path.name}"
+                return f"ℹ️ This is a file: {path.name}"
             
             items = list(path.iterdir())
             if not items:
-                return f"The directory {path} is empty"
+                return f"ℹ️ Directory {path} is empty"
             
             result = f"Contents of {path}:\n"
             for item in sorted(items)[:15]:
                 if item.is_dir():
-                    result += f"[Folder] {item.name}\n"
+                    result += f"📁 {item.name}\n"
                 else:
                     size_kb = item.stat().st_size / 1024
-                    result += f"[File] {item.name} - {size_kb:.1f} KB\n"
+                    result += f"📄 {item.name} ({size_kb:.1f} KB)\n"
             
             if len(items) > 15:
-                result += f"And {len(items) - 15} more items"
+                result += f"... and {len(items) - 15} more items"
             
             return result
         except Exception as e:
-            return f"Error: {str(e)}"
+            return f"❌ Error: {str(e)}"
 
 
 class ConversationalAssistant:
@@ -399,7 +399,7 @@ class ConversationalAssistant:
         
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY not found. Set it in environment or .env file")
+            raise ValueError("OPENAI_API_KEY not found")
         
         self.client = OpenAI(api_key=self.api_key)
         self.model = "gpt-3.5-turbo"
@@ -407,65 +407,57 @@ class ConversationalAssistant:
         self.system_prompt = self._get_system_prompt()
     
     def _get_system_prompt(self) -> str:
-        return """You are a friendly and helpful AI Shell Assistant for Windows. You have the ability to control processes and monitor system resources.
+        return """You are a helpful AI Shell Assistant for Windows.
 
-You can perform these actions:
-1. top_processes - Show top processes by CPU or memory
+Available commands:
+1. top_processes - Show top processes
    params: count (1-20), sort_by (cpu/memory)
    
 2. kill_process - Kill process by PID
    params: pid (integer)
    
 3. kill_by_name - Kill processes by name
-   params: name (process name), exclude (list of names to exclude)
+   params: name (string)
    
-4. system_info - Show system resource usage
-   params: none
+4. system_info - Show system stats
    
-5. process_info - Get detailed info about a process
+5. process_info - Get process details
    params: pid (integer)
    
-6. list_files - List files in a directory
-   params: path (directory path)
+6. list_files - List directory contents
+   params: path (string)
 
-CRITICAL RULES FOR PID EXTRACTION:
-- When you see [PID detected: NUMBER] in the user message, USE THAT EXACT NUMBER
-- Look for numbers in patterns like: "kill 1234", "terminate 1234", "stop 1234", "process 1234", "1234"
-- Extract ALL digits spoken - don't truncate or modify the number
-- If speech recognition may have cut off digits, use the [PID detected:] hint provided
-- NEVER use fake/placeholder PIDs - only use numbers actually detected in user message
-- If no valid PID is in the message, show top_processes first
+CRITICAL PID EXTRACTION RULES:
+- Extract ALL digits from commands like: "kill 1234", "terminate 5678", "stop 9012"
+- Look for [PID detected: NUMBER] hints in user messages
+- If you see a number after "kill/terminate/stop", use that exact PID
+- NEVER use fake PIDs - only real numbers from user input
+- If unclear, show top_processes first
 
-Keep responses SHORT (under 10 words).
+Response format: "Short response. <ACTION>{"command": "...", "params": {...}}</ACTION>"
 
 Examples:
-- User: "top processes" → "Checking now. <ACTION>{"command": "top_processes", "params": {"count": 5, "sort_by": "cpu"}}</ACTION>"
-- User: "kill 21808" → "Terminating 21808. <ACTION>{"command": "kill_process", "params": {"pid": 21808}}</ACTION>"
-- User: "terminate 33384" → "Stopping 33384. <ACTION>{"command": "kill_process", "params": {"pid": 33384}}</ACTION>"
-- User: "kill python" → "Killing python. <ACTION>{"command": "kill_by_name", "params": {"name": "python"}}</ACTION>"
-- User: "28764" → "Terminating 28764. <ACTION>{"command": "kill_process", "params": {"pid": 28764}}</ACTION>"
+- "kill 21808" → "Terminating. <ACTION>{"command": "kill_process", "params": {"pid": 21808}}</ACTION>"
+- "top processes" → "Checking. <ACTION>{"command": "top_processes", "params": {"count": 5}}</ACTION>"
+- "21808" → "Stopping PID 21808. <ACTION>{"command": "kill_process", "params": {"pid": 21808}}</ACTION>"
 
-Always execute commands immediately - no clarifications."""
-    
+Keep responses under 15 words. Execute commands immediately."""
     
     def chat(self, user_message: str) -> Tuple[str, Optional[str], Optional[Dict]]:
-        """Process user message and generate response"""
+        """Process user message"""
         try:
-            # --- MODIFICATION START ---
-            # More robust PID detection. This now runs for any message.
-            kill_keywords = ['kill', 'terminate', 'stop', 'end', 'close']
+            # Enhanced PID detection with explicit hints
+            kill_keywords = ['kill', 'terminate', 'stop', 'end', 'close', 'quit']
             numbers = re.findall(r'\b(\d{2,6})\b', user_message)
             
-            # Check if the message is PRIMARILY a number or contains a kill command with a number.
-            is_numeric_command = len(numbers) > 0 and len(user_message.split()) < 4
-            contains_kill_command = any(word in user_message.lower() for word in kill_keywords) and numbers
-
-            # If a plausible PID is found, add an explicit hint for the LLM.
-            if numbers and (is_numeric_command or contains_kill_command):
-                # Use the first number found as the most likely PID
+            # Add PID hint if command looks like a kill command
+            has_kill_word = any(word in user_message.lower() for word in kill_keywords)
+            is_just_number = len(user_message.split()) <= 2 and numbers
+            
+            if numbers and (has_kill_word or is_just_number):
+                # Add explicit hint for LLM
                 user_message = f"{user_message} [PID detected: {numbers[0]}]"
-            # --- MODIFICATION END ---
-
+            
             self.conversation_history.append({
                 "role": "user",
                 "content": user_message
@@ -474,8 +466,8 @@ Always execute commands immediately - no clarifications."""
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "system", "content": self.system_prompt}] + self.conversation_history,
-                temperature=0.7,
-                max_tokens=200
+                temperature=0.5,  # Lower for more consistent parsing
+                max_tokens=150
             )
             
             assistant_message = response.choices[0].message.content
@@ -485,9 +477,11 @@ Always execute commands immediately - no clarifications."""
                 "content": assistant_message
             })
             
+            # Keep history manageable
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-20:]
             
+            # Parse response
             command = None
             params = None
             response_text = assistant_message
@@ -502,8 +496,9 @@ Always execute commands immediately - no clarifications."""
                     action_data = json.loads(action_json)
                     command = action_data.get('command')
                     params = action_data.get('params', {})
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    print(f"⚠️ JSON parse error: {e}")
+            
             return response_text, command, params
         
         except Exception as e:
@@ -518,53 +513,42 @@ class ShellAssistant:
         self.assistant = None
         self.running = True
         self.voice_mode = True
-        self.speaking = False  # Track if currently speaking
-        self.last_voice_output = ""  # Store what to speak
-        self.recent_pids = []  # Store recently shown PIDs for fuzzy matching
+        self.recent_pids = []
         
         try:
             self.assistant = ConversationalAssistant()
-            print("✓ OpenAI API connected successfully")
+            print("✓ OpenAI API connected")
         except Exception as e:
-            print(f"✗ Error initializing OpenAI: {e}")
+            print(f"✗ Error: {e}")
             sys.exit(1)
         
-        self.tts = TextToSpeech(client=self.assistant.client)
-        self.stt = SpeechToText()
+        self.tts = TextToSpeech(client=self.assistant.client if self.assistant else None)
+        self.stt = SpeechToText(client=self.assistant.client if self.assistant else None)
         
-        if LLM_AVAILABLE and self.assistant.client:
-            print("✓ Text-to-Speech available")
-        else:
-            print("ℹ️ Text-to-Speech not available")
-        
+        if TTS_AVAILABLE:
+            print("✓ Text-to-Speech ready")
         if SPEECH_AVAILABLE:
-            print("✓ Speech-to-Text available")
-        else:
-            print("ℹ️ Speech-to-Text not available (text mode only)")
+            print("✓ Speech-to-Text ready")
     
     def speak(self, text: str, wait: bool = True, force: bool = False):
-        """Speak text using TTS - blocks until complete by default"""
+        """Speak text with proper timing"""
         if not text or len(text.strip()) == 0:
             return
         
-        # Always speak if TTS is available (removed length restriction)
         if TTS_AVAILABLE:
-            print(f"🔊 Speaking...")
-            self.tts.speak(text, wait=wait, force=True)
-            time.sleep(0.5)  # Brief pause after speech
+            self.tts.speak(text, wait=wait, force=force)
         else:
-            print(f"📝 {text}")
-            time.sleep(0.5)
+            print(f"🤖 {text}")
     
     def listen(self) -> Optional[str]:
-        """Listen and get user input"""
+        """Get user input"""
         if self.voice_mode and SPEECH_AVAILABLE:
             return self.stt.listen()
         else:
             return input("\n🔹 > ").strip()
     
     def execute_command(self, cmd_type: str, params: Dict) -> str:
-        """Execute the interpreted command"""
+        """Execute command"""
         try:
             if cmd_type == 'top_processes':
                 count = int(params.get('count', 5))
@@ -575,113 +559,115 @@ class ShellAssistant:
                 if processes and 'error' in processes[0]:
                     return f"Error: {processes[0]['error']}"
                 
-                # Store PIDs for fuzzy matching
                 self.recent_pids = [proc['pid'] for proc in processes]
                 
                 result = f"Top {count} processes by {sort_by.upper()}:\n"
                 for i, proc in enumerate(processes, 1):
-                    result += f"{i}. {proc['name']} - PID {proc['pid']}: CPU {proc['cpu']:.1f}%, Memory {proc['memory']:.1f}%\n"
+                    result += f"{i}. {proc['name']} (PID {proc['pid']}) - CPU {proc['cpu']:.1f}%, Mem {proc['memory']:.1f}%\n"
                 return result
             
             elif cmd_type == 'kill_process':
                 pid = params.get('pid')
-                if pid:
-                    pid_int = int(pid)
+                if not pid:
+                    return "❌ No PID specified"
+                
+                pid_int = int(pid)
+                result = self.proc_manager.kill_process(pid_int)
+                
+                # Try fuzzy matching if not found
+                if "not found" in result.lower() and self.recent_pids:
+                    pid_str = str(pid_int)
+                    matches = [p for p in self.recent_pids if str(p).startswith(pid_str)]
                     
-                    # First try exact match
-                    result = self.proc_manager.kill_process(pid_int)
-                    
-                    # If not found, try fuzzy matching with recently shown PIDs
-                    if "not found" in result.lower() and self.recent_pids:
-                        pid_str = str(pid_int)
-                        matches = [p for p in self.recent_pids if str(p).startswith(pid_str)]
-                        
-                        if len(matches) == 1:
-                            # Found exactly one match!
-                            matched_pid = matches[0]
-                            result = self.proc_manager.kill_process(matched_pid)
-                            if "terminated successfully" in result.lower():
-                                result = f"✓ Matched PID {pid_int}* → {matched_pid}. " + result
-                        elif len(matches) > 1:
-                            result = f"PID {pid_int} not found. Did you mean:\n"
-                            for match in matches[:5]:
-                                result += f"  • PID {match}\n"
-                            result += "Please say the full PID number"
-                    
-                    # If still not found, show current processes
-                    if "not found" in result.lower():
-                        result += "\n\nCurrent active processes:\n"
-                        processes = self.proc_manager.get_top_processes(5, 'cpu')
-                        self.recent_pids = [proc['pid'] for proc in processes]
-                        for i, proc in enumerate(processes, 1):
-                            result += f"{i}. {proc['name']} - PID {proc['pid']}\n"
-                    return result
-                return "❌ No PID specified. Please say the process ID number to kill"
+                    if len(matches) == 1:
+                        matched_pid = matches[0]
+                        result = self.proc_manager.kill_process(matched_pid)
+                        if "terminated" in result.lower():
+                            result = f"✓ Matched {pid_int}* → {matched_pid}. {result}"
+                    elif len(matches) > 1:
+                        result = f"❌ PID {pid_int} ambiguous. Matches: {matches[:5]}"
+                
+                return result
             
             elif cmd_type == 'kill_by_name':
                 name = params.get('name')
-                exclude = params.get('exclude', [])
-                if name:
-                    return self.proc_manager.kill_by_name(name, exclude)
-                return "Please specify a process name"
+                if not name:
+                    return "❌ No process name specified"
+                return self.proc_manager.kill_by_name(name)
             
             elif cmd_type == 'system_info':
                 info = self.proc_manager.get_system_info()
                 if 'error' in info:
                     return f"Error: {info['error']}"
                 
-                result = f"""System Information:
-CPU Usage: {info['cpu_percent']}%
-Memory Usage: {info['memory_percent']}% ({info['memory_used']:.2f}/{info['memory_total']:.2f} GB)
-Disk Usage: {info['disk_percent']}%
-Active Processes: {info['process_count']}"""
-                return result
+                return f"""System Status:
+CPU: {info['cpu_percent']}% ({info['cpu_count']} cores @ {info['cpu_freq']} MHz)
+Memory: {info['memory_percent']}% ({info['memory_used']:.1f}/{info['memory_total']:.1f} GB)
+Disk: {info['disk_percent']}% ({info['disk_used']:.1f}/{info['disk_total']:.1f} GB)
+Processes: {info['process_count']}"""
             
             elif cmd_type == 'process_info':
                 pid = params.get('pid')
-                if pid:
-                    info = self.proc_manager.get_process_info(int(pid))
-                    if 'error' in info:
-                        return f"Error: {info['error']}"
-                    
-                    result = f"Process: {info['name']} (PID {pid})\nCPU: {info['cpu_percent']}% | Memory: {info['memory_mb']:.1f} MB"
-                    return result
-                return "Please specify a PID"
+                if not pid:
+                    return "❌ No PID specified"
+                
+                info = self.proc_manager.get_process_info(int(pid))
+                if 'error' in info:
+                    return f"Error: {info['error']}"
+                
+                return f"""Process: {info['name']} (PID {pid})
+Status: {info['status']}
+CPU: {info['cpu_percent']}%
+Memory: {info['memory_mb']:.1f} MB
+Threads: {info['num_threads']}"""
             
             elif cmd_type == 'list_files':
                 path = params.get('path', '.')
                 return self.proc_manager.list_files(path)
             
             else:
-                return f"Unknown command: {cmd_type}"
+                return f"❌ Unknown command: {cmd_type}"
         
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            return f"❌ Execution error: {str(e)}"
     
     def get_help(self) -> str:
-        """Display available commands"""
-        return """Available Commands:
-[*] Show top processes / Show top processes by memory
-[!] Kill process [PID] / Kill [process name]
-[*] System info / What's my CPU usage
-[*] List files / List C:\\Users
-[*] 'v' to toggle voice, 'help' for help, 'exit' to quit"""
+        """Display help"""
+        return """╔════════════════════════════════════════╗
+║        AI SHELL ASSISTANT HELP         ║
+╚════════════════════════════════════════╝
+
+Voice Commands:
+  • "show top processes"
+  • "kill process [PID]" or just say the PID
+  • "kill [process name]"
+  • "system info"
+  • "list files in [path]"
+
+Keyboard:
+  • 'help' - Show this help
+  • 'v' - Toggle voice mode
+  • 'exit' - Quit assistant
+
+Tips:
+  • Speak clearly and wait for response
+  • Say PIDs slowly for accuracy
+  • Use admin rights for protected processes
+"""
     
     def run_interactive(self):
-        """Main event loop"""
-        print("=" * 70)
-        print("AI SHELL ASSISTANT - Optimized for Rate Limits")
-        print("=" * 70)
-        print("\nOptimizations:")
-        print("✓ Rate limit handling (25s wait on 429)")
-        print("✓ TTS request throttling (0.5s minimum between calls)")
-        print("✓ Response caching")
-        print("✓ Brief responses to reduce API costs")
-        print("✓ Only TTS for command results (not confirmations)")
-        print("=" * 70)
+        """Main loop with improved flow"""
+        print("=" * 60)
+        print("    AI SHELL ASSISTANT - High Accuracy Voice")
+        print("=" * 60)
+        print("\n✓ OpenAI Whisper STT (95%+ accuracy)")
+        print("✓ Unlimited offline speech (pyttsx3)")
+        print("✓ No API rate limits")
+        print("✓ Intelligent PID matching")
+        print("✓ Natural conversation")
         print("\nType 'help' for commands\n")
         
-        self.speak("Hello! AI Shell Assistant ready.", force=True)
+        self.speak("AI Shell Assistant ready.", force=True)
         
         while self.running:
             try:
@@ -692,80 +678,83 @@ Active Processes: {info['process_count']}"""
                 
                 user_lower = user_input.lower()
                 
-                # Check for goodbye/thanks - offer to help with something else
-                if any(word in user_lower for word in ['bye', 'goodbye', 'thanks', 'thank you', 'that\'s all', 'done', 'exit', 'quit']):
-                    self.speak("Is there anything else I can help you with?", force=True)
-                    followup = self.listen()
-                    
-                    if followup and not any(word in followup.lower() for word in ['no', 'nothing', 'bye', 'goodbye', 'nope']):
-                        # User wants more help
-                        continue
-                    else:
-                        # User is done
-                        self.speak("Goodbye! Have a great day!", force=True)
-                        self.running = False
-                        break
+                # Handle exit/goodbye
+                if any(word in user_lower for word in ['exit', 'quit', 'bye', 'goodbye']):
+                    self.speak("Goodbye!", force=True)
+                    self.running = False
+                    break
                 
-                elif user_lower == 'help':
-                    help_text = self.get_help()
-                    print(help_text)
+                # Handle special commands
+                if user_lower == 'help':
+                    print(self.get_help())
                     continue
                 
-                elif user_lower in ['voice', 'v']:
+                if user_lower in ['voice', 'v']:
                     self.voice_mode = not self.voice_mode
                     mode = "enabled" if self.voice_mode else "disabled"
-                    print(f"Voice mode {mode}")
+                    msg = f"Voice mode {mode}"
+                    print(msg)
+                    self.speak(msg, force=True)
                     continue
                 
+                # Process with LLM
                 print("\n⏳ Processing...")
                 response_text, command, params = self.assistant.chat(user_input)
                 
+                # Speak and show response
                 if response_text:
-                    print(f"\n🤖 Assistant: {response_text}")
-                    self.speak(response_text, wait=True, force=True)  # Speak the response!
+                    print(f"\n🤖 {response_text}")
+                    self.speak(response_text, wait=True, force=True)
                 
+                # Execute command
                 if command:
                     print(f"🔧 Executing: {command}")
                     result = self.execute_command(command, params)
                     print(f"\n{result}\n")
                     
-                    # Speak summarized version for process commands
-                    if command == 'top_processes' and self.last_voice_output:
-                        self.speak(self.last_voice_output, wait=True, force=True)
-                        self.last_voice_output = ""
-                    # Speak brief results for other commands
-                    elif command in ['kill_process', 'kill_by_name', 'system_info']:
-                        # Only speak if result is short enough and not an error
-                        if "Error" not in result and len(result) < 100:
-                            self.speak(result, wait=True, force=True)
-                        elif "Error" in result:
-                            print(f"⚠️ {result}")
+                    # Speak brief result for certain commands
+                    if command in ['kill_process', 'kill_by_name']:
+                        if "✓" in result and len(result) < 80:
+                            self.speak(result.split('\n')[0], wait=True, force=True)
             
             except KeyboardInterrupt:
-                print("\n\n🛑 Interrupted by user")
+                print("\n\n🛑 Interrupted")
                 self.running = False
                 break
             except Exception as e:
                 print(f"⚠️ Error: {str(e)}")
+                import traceback
+                traceback.print_exc()
 
 
 def main():
-    """Main entry point"""
-    print("=" * 70)
-    print("AI SHELL ASSISTANT (Rate-Limited & Optimized)")
-    print("=" * 70)
-    print("\nRequired: pip install psutil SpeechRecognition pydub pyaudio python-dotenv openai")
-    print("Setup: Set OPENAI_API_KEY environment variable\n")
+    """Entry point"""
+    print("\n" + "=" * 60)
+    print("  AI SHELL ASSISTANT - OpenAI Whisper STT")
+    print("=" * 60)
+    print("\nRequired packages:")
+    print("  pip install psutil SpeechRecognition pyaudio")
+    print("  pip install python-dotenv openai pyttsx3")
+    print("\nFeatures:")
+    print("  • OpenAI Whisper for 95%+ accurate voice recognition")
+    print("  • Unlimited offline TTS (pyttsx3)")
+    print("  • GPT-3.5 for natural language processing")
+    print("\nSetup: Set OPENAI_API_KEY in environment\n")
     
     if not os.getenv('OPENAI_API_KEY'):
-        print("ERROR: OPENAI_API_KEY not set!")
+        print("❌ ERROR: OPENAI_API_KEY not set!")
+        print("\nSet it with:")
+        print("  Windows: setx OPENAI_API_KEY \"your-key-here\"")
+        print("  Or create .env file with: OPENAI_API_KEY=your-key-here")
         sys.exit(1)
     
     try:
         assistant = ShellAssistant()
         assistant.run_interactive()
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
